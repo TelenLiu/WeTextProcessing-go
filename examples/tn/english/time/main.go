@@ -1,0 +1,30 @@
+package main
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"time"
+
+	en "github.com/TelenLiu/WeTextProcessing-go/tn/english"
+)
+
+func main() {
+	cacheDir := filepath.Join(".cache", "tn", "english", "time")
+	os.MkdirAll(cacheDir, 0755)
+
+	n := en.NewNormalizer(cacheDir, true)
+
+	testCases := []string{
+		"2:02",
+		"11:00",
+		"13:10:36",
+	}
+
+	fmt.Println("=== Time 规则示例 ===")
+	for _, input := range testCases {
+		start := time.Now()
+		output := n.Normalize(input)
+		fmt.Printf("输入: %q\n输出: %q (%v)\n\n", input, output, time.Since(start))
+	}
+}
