@@ -68,6 +68,7 @@ func AddWeight(fst *Fst, weight float64) *Fst {
 
 	// Copy original FST with state offset of 1
 	for from, state := range fst.States {
+		result.AddState(from + 1)
 		for _, arc := range state.Arcs {
 			result.AddArc(from+1, arc.Next+1, arc.ILabel, arc.OLabel, arc.Weight)
 		}
@@ -92,6 +93,7 @@ func Join(expr *Fst, sep *Fst) *Fst {
 func epsilonInsert(f *Fst) *Fst {
 	result := NewFst()
 	for from, state := range f.States {
+		result.AddState(from)
 		for _, arc := range state.Arcs {
 			result.AddArc(from, arc.Next, "", arc.OLabel, arc.Weight)
 		}
@@ -106,6 +108,7 @@ func epsilonInsert(f *Fst) *Fst {
 func epsilonDelete(f *Fst) *Fst {
 	result := NewFst()
 	for from, state := range f.States {
+		result.AddState(from)
 		for _, arc := range state.Arcs {
 			result.AddArc(from, arc.Next, arc.ILabel, "", arc.Weight)
 		}
