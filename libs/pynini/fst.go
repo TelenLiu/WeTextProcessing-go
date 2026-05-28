@@ -174,7 +174,6 @@ func Union(fs ...*Fst) *Fst {
 		}
 		result = result.Union(fs[i])
 	}
-	result = result.Optimize()
 	return result
 }
 
@@ -823,37 +822,101 @@ func ComposeInputWithFst(inputStr string, f *Fst, other *Fst) string {
 		return result, count
 	}
 
+	// Initial beam and cache base epsilon closure from start.
+	// For FINAL matched states, the epsilon closure always goes through
+	// Star restart(2.0) → main start → all states, so the result is the
+	// same set (all states) with weights shifted by matchedWeight + 2.0.
+	// We cache this to avoid the O(284K) BFS per character.
 	beam := newBeam()
 	beam.weights[other.Start] = 0
 	beam.outputs[other.Start] = ""
-	beam, _ = epsilonClosure(beam, 1)
+	baseBeam, _ := epsilonClosure(beam, 1)
 
 	for _, ch := range runes {
 		charStr := string(ch)
 		targets := matchIndex[charStr]
 
-		nextBeam := newBeam()
-		matchCount := 0
+		type mr struct {
+			weight  float64
+			output  string
+			isFinal bool
+		}
+		matched := make(map[int]*mr)
+		bestFinalW := 1e30
+		bestFinalO := ""
 		for _, tgt := range targets {
 			w := beam.weights[tgt.src]
 			if !math.IsNaN(w) {
-				newW := w + tgt.weight
-				newO := beam.outputs[tgt.src] + tgt.output
-				if math.IsNaN(nextBeam.weights[tgt.next]) || newW < nextBeam.weights[tgt.next] {
-					if math.IsNaN(nextBeam.weights[tgt.next]) {
-						matchCount++
-					}
-					nextBeam.weights[tgt.next] = newW
-					nextBeam.outputs[tgt.next] = newO
+				nw := w + tgt.weight
+				no := beam.outputs[tgt.src] + tgt.output
+				if prev, ok := matched[tgt.next]; !ok || nw < prev.weight {
+					st := other.States[tgt.next]
+					matched[tgt.next] = &mr{weight: nw, output: no, isFinal: st != nil && st.Final}
 				}
 			}
 		}
 
-		if matchCount == 0 {
+		if len(matched) == 0 {
 			continue
 		}
 
-		beam, _ = epsilonClosure(nextBeam, matchCount)
+		nb := newBeam()
+
+		hasFinal := false
+		needBFS := false
+		for _, m := range matched {
+			if m.isFinal {
+				hasFinal = true
+				if m.weight < bestFinalW {
+					bestFinalW = m.weight
+					bestFinalO = m.output
+				}
+			} else {
+				needBFS = true
+			}
+		}
+
+		if hasFinal {
+			for s2 := 0; s2 < nStates; s2++ {
+				bw := baseBeam.weights[s2]
+				if !math.IsNaN(bw) {
+					nb.weights[s2] = bestFinalW + 2.0 + bw
+					nb.outputs[s2] = bestFinalO + baseBeam.outputs[s2]
+				}
+			}
+			for s2, m := range matched {
+				if m.isFinal {
+					nb.weights[s2] = m.weight
+					nb.outputs[s2] = m.output
+				}
+			}
+		}
+
+		if needBFS {
+			bb := newBeam()
+			bc := 0
+			for s2, m := range matched {
+				if !m.isFinal {
+					bb.weights[s2] = m.weight
+					bb.outputs[s2] = m.output
+					bc++
+				}
+			}
+			if bc > 0 {
+				br, _ := epsilonClosure(bb, bc)
+				for s2 := 0; s2 < nStates; s2++ {
+					bw := br.weights[s2]
+					if !math.IsNaN(bw) {
+						if math.IsNaN(nb.weights[s2]) || bw < nb.weights[s2] {
+							nb.weights[s2] = bw
+							nb.outputs[s2] = br.outputs[s2]
+						}
+					}
+				}
+			}
+		}
+
+		beam = nb
 	}
 
 	bestOutput := ""

@@ -2,6 +2,7 @@ package tn
 
 import (
 	"os"
+	"sync"
 	"time"
 
 	"github.com/TelenLiu/WeTextProcessing-go/fstcache"
@@ -40,6 +41,14 @@ type Processor struct {
 	cachePrefix         string
 	taggerBuilder       func() *pynini.Fst
 	verbalizerBuilder   func() *pynini.Fst
+
+	// Build configuration
+	buildConcurrency int
+	buildProgress    BuildProgressFn
+}
+
+func (p *Processor) GetBuildConfig() (concurrency int, progress BuildProgressFn) {
+	return p.buildConcurrency, p.buildProgress
 }
 
 func NewProcessor(name string, ordertype ...string) *Processor {
@@ -74,21 +83,35 @@ func NewProcessor(name string, ordertype ...string) *Processor {
 		pynini.Cross("\\\"", "\""),
 	)
 	p.SIGMA = sigmaBase.Star()
-	p.NOT_QUOTE = p.VCHAR.Difference(pynini.Accep("\""))
-	p.NOT_SPACE = p.VCHAR.Difference(p.SPACE)
+
+	// Parallel: independent VCHAR/SPACE operations and TO_LOWER
+	var wg sync.WaitGroup
+	wg.Add(3)
+	var notQuote, notSpace, toLower *pynini.Fst
+	go func() { notQuote = p.VCHAR.Difference(pynini.Accep("\"")); wg.Done() }()
+	go func() { notSpace = p.VCHAR.Difference(p.SPACE); wg.Done() }()
+	go func() {
+		lower := "abcdefghijklmnopqrstuvwxyz"
+		upper := "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+		var fsts []*pynini.Fst
+		for i := 0; i < len(lower); i++ {
+			fsts = append(fsts, pynini.Cross(string(upper[i]), string(lower[i])))
+		}
+		toLower = pynini.Union(fsts...)
+		wg.Done()
+	}()
+
+	// Sequential: trivial SPACE-dependent ops (negligible cost)
 	p.INSERT_SPACE = lib.Insert(" ")
 	p.DELETE_SPACE = lib.Delete(p.SPACE).Star()
 	p.DELETE_EXTRA_SPACE = pynini.Cross(p.SPACE.Plus(), pynini.Accep(" "))
 	p.DELETE_ZERO_OR_ONE_SPACE = lib.Delete(p.SPACE).Ques()
 
-	lowercase := "abcdefghijklmnopqrstuvwxyz"
-	uppercase := "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-	var toLowerFsts []*pynini.Fst
-	for i := 0; i < len(lowercase); i++ {
-		toLowerFsts = append(toLowerFsts, pynini.Cross(string(uppercase[i]), string(lowercase[i])))
-	}
-	p.TO_LOWER = pynini.Union(toLowerFsts...)
-	p.TO_UPPER = p.TO_LOWER.Invert()
+	wg.Wait()
+	p.NOT_QUOTE = notQuote
+	p.NOT_SPACE = notSpace
+	p.TO_LOWER = toLower
+	p.TO_UPPER = toLower.Invert()
 
 	return p
 }
@@ -116,13 +139,23 @@ func (p *Processor) BuildVerbalizer() {
 	p.Verbalizer = p.DeleteTokens(verbalizer)
 }
 
+// BuildProgressFn reports build progress: stage name, current step, total steps.
+type BuildProgressFn func(stage string, current, total int)
+
 // BuildFstWithCache handles cache read/write for tagger and verbalizer using
 // the FST cache manager (lazy load + TTL eviction). To skip the cache and
 // force a rebuild, set overwriteCache=true or set ttl=0.
-func (p *Processor) BuildFstWithCache(prefix, cacheDir string, overwriteCache bool, buildTagger, buildVerbalizer func()) {
+// concurrency controls how many rules are built in parallel (default 2).
+// progress is an optional callback for build progress reporting.
+func (p *Processor) BuildFstWithCache(prefix, cacheDir string, overwriteCache bool, concurrency int, progress BuildProgressFn, buildTagger, buildVerbalizer func()) {
 	if cacheDir == "" {
 		cacheDir = ".cache"
 	}
+	if concurrency < 1 {
+		concurrency = 2
+	}
+	p.buildConcurrency = concurrency
+	p.buildProgress = progress
 	os.MkdirAll(cacheDir, 0755)
 
 	// Initialize cache manager (10 min TTL eviction)
@@ -147,11 +180,21 @@ func (p *Processor) BuildFstWithCache(prefix, cacheDir string, overwriteCache bo
 	}
 
 	// Pre-load tagger and verbalizer into memory via cache
+	if progress != nil {
+		progress("加载Tagger", 1, 2)
+	}
 	p.Tagger = p.cache.GetOrBuild(prefix+"_tagger", p.taggerBuilder)
+	if progress != nil {
+		progress("加载Verbalizer", 2, 2)
+	}
 	p.Verbalizer = p.cache.GetOrBuild(prefix+"_verbalizer", p.verbalizerBuilder)
+	if progress != nil {
+		progress("完成", 2, 2)
+	}
 }
 
 func (p *Processor) BuildFst(prefix, cacheDir string, overwriteCache bool) {
+	p.BuildFstWithCache(prefix, cacheDir, overwriteCache, 0, nil, func() {}, func() {})
 }
 
 // loadTagger returns the tagger FST, loading via cache if needed.

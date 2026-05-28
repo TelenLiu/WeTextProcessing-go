@@ -2,6 +2,7 @@ package english
 
 import (
 	"strings"
+	"sync"
 
 	"github.com/TelenLiu/WeTextProcessing-go/libs/pynini"
 	"github.com/TelenLiu/WeTextProcessing-go/libs/pynini/lib"
@@ -32,16 +33,21 @@ type Normalizer struct {
 func NewNormalizer(
 	cacheDir string,
 	overwriteCache bool,
+	progress ...tn.BuildProgressFn,
 ) *Normalizer {
 	n := &Normalizer{
 		Processor: tn.NewProcessor("en_normalizer", "en_tn"),
 	}
-	n.BuildFst("en_tn", cacheDir, overwriteCache)
+	var pf tn.BuildProgressFn
+	if len(progress) > 0 {
+		pf = progress[0]
+	}
+	n.BuildFst("en_tn", cacheDir, overwriteCache, 0, pf)
 	return n
 }
 
-func (n *Normalizer) BuildFst(prefix, cacheDir string, overwriteCache bool) {
-	n.Processor.BuildFstWithCache(prefix, cacheDir, overwriteCache, n.buildTaggerInternal, n.buildVerbalizerInternal)
+func (n *Normalizer) BuildFst(prefix, cacheDir string, overwriteCache bool, concurrency int, progress tn.BuildProgressFn) {
+	n.Processor.BuildFstWithCache(prefix, cacheDir, overwriteCache, concurrency, progress, n.buildTaggerInternal, n.buildVerbalizerInternal)
 }
 
 func (n *Normalizer) BuildTagger() {
@@ -49,20 +55,40 @@ func (n *Normalizer) BuildTagger() {
 }
 
 func (n *Normalizer) buildTaggerInternal() {
-	n.cardinalRule = rules.NewCardinal()
-	n.ordinalRule = rules.NewOrdinal()
-	n.decimalRule = rules.NewDecimal()
-	n.fractionRule = rules.NewFraction()
-	n.dateRule = rules.NewDate()
-	n.timeRule = rules.NewTime()
-	n.measureRule = rules.NewMeasure()
-	n.moneyRule = rules.NewMoney()
-	n.telephoneRule = rules.NewTelephone()
-	n.electronicRule = rules.NewElectronic()
-	n.wordRule = rules.NewWord()
-	n.whitelistRule = rules.NewWhitelist()
-	n.punctRule = rules.NewPunctuation()
-	n.rangeRule = rules.NewRange()
+	concurrency, progress := n.Processor.GetBuildConfig()
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+
+	type task struct{ name string; fn func() }
+	tasks := []task{
+		{"cardinal", func() { n.cardinalRule = rules.NewCardinal() }},
+		{"ordinal", func() { n.ordinalRule = rules.NewOrdinal() }},
+		{"decimal", func() { n.decimalRule = rules.NewDecimal() }},
+		{"fraction", func() { n.fractionRule = rules.NewFraction() }},
+		{"date", func() { n.dateRule = rules.NewDate() }},
+		{"time", func() { n.timeRule = rules.NewTime() }},
+		{"measure", func() { n.measureRule = rules.NewMeasure() }},
+		{"money", func() { n.moneyRule = rules.NewMoney() }},
+		{"telephone", func() { n.telephoneRule = rules.NewTelephone() }},
+		{"electronic", func() { n.electronicRule = rules.NewElectronic() }},
+		{"word", func() { n.wordRule = rules.NewWord() }},
+		{"whitelist", func() { n.whitelistRule = rules.NewWhitelist() }},
+		{"punct", func() { n.punctRule = rules.NewPunctuation() }},
+		{"range", func() { n.rangeRule = rules.NewRange() }},
+	}
+	for i, t := range tasks {
+		wg.Add(1)
+		go func(tt task, idx int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			tt.fn()
+			<-sem
+			if progress != nil {
+				progress("构建Tagger-"+tt.name, idx+1, len(tasks))
+			}
+		}(t, i)
+	}
+	wg.Wait()
 
 	cardinal := lib.AddWeight(n.cardinalRule.Tagger, 1.0)
 	ordinal := lib.AddWeight(n.ordinalRule.Tagger, 1.0)

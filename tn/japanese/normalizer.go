@@ -1,6 +1,8 @@
 package japanese
 
 import (
+	"sync"
+
 	"github.com/TelenLiu/WeTextProcessing-go/libs/pynini"
 	"github.com/TelenLiu/WeTextProcessing-go/libs/pynini/lib"
 	"github.com/TelenLiu/WeTextProcessing-go/tn"
@@ -41,6 +43,7 @@ func NewNormalizer(
 	remove_puncts bool,
 	full_to_half bool,
 	tag_oov bool,
+	progress ...tn.BuildProgressFn,
 ) *Normalizer {
 	n := &Normalizer{
 		Processor:            tn.NewProcessor("ja_normalizer"),
@@ -50,12 +53,16 @@ func NewNormalizer(
 		full_to_half:         full_to_half,
 		tag_oov:              tag_oov,
 	}
-	n.BuildFst("ja_tn", cache_dir, overwrite_cache)
+	var pf tn.BuildProgressFn
+	if len(progress) > 0 {
+		pf = progress[0]
+	}
+	n.BuildFst("ja_tn", cache_dir, overwrite_cache, 0, pf)
 	return n
 }
 
-func (n *Normalizer) BuildFst(prefix, cacheDir string, overwriteCache bool) {
-	n.Processor.BuildFstWithCache(prefix, cacheDir, overwriteCache, n.buildTaggerInternal, n.buildVerbalizerInternal)
+func (n *Normalizer) BuildFst(prefix, cacheDir string, overwriteCache bool, concurrency int, progress tn.BuildProgressFn) {
+	n.Processor.BuildFstWithCache(prefix, cacheDir, overwriteCache, concurrency, progress, n.buildTaggerInternal, n.buildVerbalizerInternal)
 }
 
 // BuildTagger builds the tagger FST (kept for backward compatibility)
@@ -64,20 +71,42 @@ func (n *Normalizer) BuildTagger() {
 }
 
 func (n *Normalizer) buildTaggerInternal() {
-	// Create all rules once and share between tagger and verbalizer
-	n.cardinalRule = rules.NewCardinal()
-	n.dateRule = rules.NewDate()
-	n.whitelistRule = rules.NewWhitelist()
-	n.sportRule = rules.NewSport()
-	n.fractionRule = rules.NewFraction()
-	n.measureRule = rules.NewMeasure()
-	n.moneyRule = rules.NewMoney()
-	n.timeRule = rules.NewTime()
-	n.mathRule = rules.NewMathWithCardinal(n.cardinalRule)
-	n.charRule = rules.NewChar()
-	n.translitRule = rules.NewTransliteration()
+	concurrency, progress := n.Processor.GetBuildConfig()
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
 
-	// Do NOT compose PreProcessor into the Tagger FST - apply at runtime instead
+	type task struct{ name string; fn func() }
+	tasks := []task{
+		{"cardinal", func() { n.cardinalRule = rules.NewCardinal() }},
+		{"date", func() { n.dateRule = rules.NewDate() }},
+		{"whitelist", func() { n.whitelistRule = rules.NewWhitelist() }},
+		{"sport", func() { n.sportRule = rules.NewSport() }},
+		{"fraction", func() { n.fractionRule = rules.NewFraction() }},
+		{"measure", func() { n.measureRule = rules.NewMeasure() }},
+		{"money", func() { n.moneyRule = rules.NewMoney() }},
+		{"time", func() { n.timeRule = rules.NewTime() }},
+		{"char", func() { n.charRule = rules.NewChar() }},
+		{"translit", func() { n.translitRule = rules.NewTransliteration() }},
+	}
+	for i, t := range tasks {
+		wg.Add(1)
+		go func(tt task, idx int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			tt.fn()
+			<-sem
+			if progress != nil {
+				progress("构建Tagger-"+tt.name, idx+1, len(tasks)+1)
+			}
+		}(t, i)
+	}
+	wg.Wait()
+
+	n.mathRule = rules.NewMathWithCardinal(n.cardinalRule)
+	if progress != nil {
+		progress("构建Tagger-math", len(tasks)+1, len(tasks)+1)
+	}
+
 	n.preProcessor = rules.NewPreProcessor(n.full_to_half)
 
 	cardinal := lib.AddWeight(n.cardinalRule.Tagger, 1.06)

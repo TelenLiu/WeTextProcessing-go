@@ -1,6 +1,8 @@
 package chinese
 
 import (
+	"sync"
+
 	"github.com/TelenLiu/WeTextProcessing-go/libs/pynini"
 	"github.com/TelenLiu/WeTextProcessing-go/libs/pynini/lib"
 	"github.com/TelenLiu/WeTextProcessing-go/tn"
@@ -42,6 +44,7 @@ func NewNormalizer(
 	remove_puncts bool,
 	full_to_half bool,
 	tag_oov bool,
+	progress ...tn.BuildProgressFn,
 ) *Normalizer {
 	n := &Normalizer{
 		Processor:            tn.NewProcessor("zh_normalizer"),
@@ -52,12 +55,16 @@ func NewNormalizer(
 		full_to_half:         full_to_half,
 		tag_oov:              tag_oov,
 	}
-	n.BuildFst("zh_tn", cache_dir, overwrite_cache)
+	var pf tn.BuildProgressFn
+	if len(progress) > 0 {
+		pf = progress[0]
+	}
+	n.BuildFst("zh_tn", cache_dir, overwrite_cache, 0, pf)
 	return n
 }
 
-func (n *Normalizer) BuildFst(prefix, cacheDir string, overwriteCache bool) {
-	n.Processor.BuildFstWithCache(prefix, cacheDir, overwriteCache, n.buildTaggerInternal, n.buildVerbalizerInternal)
+func (n *Normalizer) BuildFst(prefix, cacheDir string, overwriteCache bool, concurrency int, progress tn.BuildProgressFn) {
+	n.Processor.BuildFstWithCache(prefix, cacheDir, overwriteCache, concurrency, progress, n.buildTaggerInternal, n.buildVerbalizerInternal)
 }
 
 // BuildTagger builds the tagger FST (kept for backward compatibility)
@@ -66,21 +73,51 @@ func (n *Normalizer) BuildTagger() {
 }
 
 func (n *Normalizer) buildTaggerInternal() {
-	// Create all rules once and share between tagger and verbalizer
-	n.cardinalRule = rules.NewCardinal()
-	n.dateRule = rules.NewDate()
-	n.whitelistRule = rules.NewWhitelist(n.remove_erhua)
-	n.sportRule = rules.NewSport()
-	n.fractionRule = rules.NewFraction()
-	n.measureRule = rules.NewMeasure()
-	n.moneyRule = rules.NewMoney()
-	n.timeRule = rules.NewTime()
-	n.mathRule = rules.NewMathWithCardinal(n.cardinalRule)
-	n.charRule = rules.NewChar()
+	concurrency, progress := n.Processor.GetBuildConfig()
 
-	// Do NOT compose PreProcessor into the Tagger FST - apply at runtime instead
+	type ruleTask struct {
+		name string
+		fn   func()
+	}
+	// All rules except math (depends on cardinal)
+	independent := []ruleTask{
+		{"cardinal", func() { n.cardinalRule = rules.NewCardinal() }},
+		{"date", func() { n.dateRule = rules.NewDate() }},
+		{"whitelist", func() { n.whitelistRule = rules.NewWhitelist(n.remove_erhua) }},
+		{"sport", func() { n.sportRule = rules.NewSport() }},
+		{"fraction", func() { n.fractionRule = rules.NewFraction() }},
+		{"measure", func() { n.measureRule = rules.NewMeasure() }},
+		{"money", func() { n.moneyRule = rules.NewMoney() }},
+		{"time", func() { n.timeRule = rules.NewTime() }},
+		{"char", func() { n.charRule = rules.NewChar() }},
+	}
+
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+	for i, t := range independent {
+		wg.Add(1)
+		go func(task ruleTask, idx int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			task.fn()
+			<-sem
+			if progress != nil {
+				progress("构建Tagger-"+task.name, idx+1, len(independent)+1)
+			}
+		}(t, i)
+	}
+	wg.Wait()
+
+	// mathRule depends on cardinalRule
+	n.mathRule = rules.NewMathWithCardinal(n.cardinalRule)
+	if progress != nil {
+		progress("构建Tagger-math", len(independent)+1, len(independent)+1)
+	}
+
+	// PreProcessor is not composed into FST
 	n.preProcessor = rules.NewPreProcessor(n.traditional_to_simple)
 
+	// Sequential: AddWeight + Union + Star (PURE FST ops, no rule construction)
 	date := lib.AddWeight(n.dateRule.Tagger, 1.02)
 	whitelist := lib.AddWeight(n.whitelistRule.Tagger, 1.03)
 	sport := lib.AddWeight(n.sportRule.Tagger, 1.04)

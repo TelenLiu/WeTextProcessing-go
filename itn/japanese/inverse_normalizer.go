@@ -36,6 +36,7 @@ func NewInverseNormalizer(
 	enable_standalone_number bool,
 	enable_0_to_9 bool,
 	enable_million bool,
+	progress ...tn.BuildProgressFn,
 ) *InverseNormalizer {
 	n := &InverseNormalizer{
 		Processor:                tn.NewProcessor("ja_inverse_normalizer", "itn"),
@@ -44,12 +45,16 @@ func NewInverseNormalizer(
 		enable_0_to_9:            enable_0_to_9,
 		enable_million:           enable_million,
 	}
-	n.BuildFst("ja_itn", cache_dir, overwrite_cache)
+	var pf tn.BuildProgressFn
+	if len(progress) > 0 {
+		pf = progress[0]
+	}
+	n.BuildFst("ja_itn", cache_dir, overwrite_cache, 0, pf)
 	return n
 }
 
-func (n *InverseNormalizer) BuildFst(prefix, cacheDir string, overwriteCache bool) {
-	n.Processor.BuildFstWithCache(prefix, cacheDir, overwriteCache, n.buildTaggerInternal, n.buildVerbalizerInternal)
+func (n *InverseNormalizer) BuildFst(prefix, cacheDir string, overwriteCache bool, concurrency int, progress tn.BuildProgressFn) {
+	n.Processor.BuildFstWithCache(prefix, cacheDir, overwriteCache, concurrency, progress, n.buildTaggerInternal, n.buildVerbalizerInternal)
 }
 
 // BuildTagger builds the tagger FST (kept for backward compatibility)
