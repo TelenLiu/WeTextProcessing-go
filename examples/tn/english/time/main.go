@@ -10,7 +10,7 @@ import (
 )
 
 func main() {
-	cacheDir := filepath.Join(".cache", "tn", "english", "time")
+	cacheDir := filepath.Join("cache", "tn", "english", "time")
 	os.MkdirAll(cacheDir, 0755)
 
 	n := en.NewNormalizer(cacheDir, true)

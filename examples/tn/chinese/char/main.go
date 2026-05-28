@@ -10,7 +10,7 @@ import (
 )
 
 func main() {
-	cacheDir := filepath.Join(".cache", "tn", "chinese", "char")
+	cacheDir := filepath.Join("cache", "tn", "chinese", "char")
 	os.MkdirAll(cacheDir, 0755)
 
 	n := chinese.NewNormalizer(cacheDir, true, false, false, false, false, false, false)

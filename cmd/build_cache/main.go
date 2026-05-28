@@ -15,7 +15,7 @@ import (
 )
 
 func main() {
-	cacheDir := ".cache"
+	cacheDir := "cache"
 	if len(os.Args) > 1 {
 		cacheDir = os.Args[1]
 	}

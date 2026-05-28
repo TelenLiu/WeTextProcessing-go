@@ -2,6 +2,7 @@ package tn
 
 import (
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -45,6 +46,9 @@ type Processor struct {
 	// Build configuration
 	buildConcurrency int
 	buildProgress    BuildProgressFn
+
+	// Lazy base FST initialization
+	baseFstLoaded bool
 }
 
 func (p *Processor) GetBuildConfig() (concurrency int, progress BuildProgressFn) {
@@ -69,6 +73,15 @@ func NewProcessor(name string, ordertype ...string) *Processor {
 		UPPER:      lib.UPPER,
 		MIN_NEG_WEIGHT: -0.0001,
 	}
+	return p
+}
+
+// buildBaseFst constructs all base FSTs from scratch (expensive, ~80% of build time).
+func (p *Processor) buildBaseFst() {
+	if p.baseFstLoaded {
+		return
+	}
+	p.baseFstLoaded = true
 
 	p.VSIGMA = p.VCHAR.Star()
 	CHAR := p.VCHAR.Difference(pynini.Union(pynini.Accep("\\"), pynini.Accep("\"")))
@@ -84,7 +97,6 @@ func NewProcessor(name string, ordertype ...string) *Processor {
 	)
 	p.SIGMA = sigmaBase.Star()
 
-	// Parallel: independent VCHAR/SPACE operations and TO_LOWER
 	var wg sync.WaitGroup
 	wg.Add(3)
 	var notQuote, notSpace, toLower *pynini.Fst
@@ -101,7 +113,6 @@ func NewProcessor(name string, ordertype ...string) *Processor {
 		wg.Done()
 	}()
 
-	// Sequential: trivial SPACE-dependent ops (negligible cost)
 	p.INSERT_SPACE = lib.Insert(" ")
 	p.DELETE_SPACE = lib.Delete(p.SPACE).Star()
 	p.DELETE_EXTRA_SPACE = pynini.Cross(p.SPACE.Plus(), pynini.Accep(" "))
@@ -112,8 +123,6 @@ func NewProcessor(name string, ordertype ...string) *Processor {
 	p.NOT_SPACE = notSpace
 	p.TO_LOWER = toLower
 	p.TO_UPPER = toLower.Invert()
-
-	return p
 }
 
 func (p *Processor) BuildRule(fst *pynini.Fst, l, r string) *pynini.Fst {
@@ -149,7 +158,7 @@ type BuildProgressFn func(stage string, current, total int)
 // progress is an optional callback for build progress reporting.
 func (p *Processor) BuildFstWithCache(prefix, cacheDir string, overwriteCache bool, concurrency int, progress BuildProgressFn, buildTagger, buildVerbalizer func()) {
 	if cacheDir == "" {
-		cacheDir = ".cache"
+		cacheDir = "cache"
 	}
 	if concurrency < 1 {
 		concurrency = 2
@@ -157,6 +166,15 @@ func (p *Processor) BuildFstWithCache(prefix, cacheDir string, overwriteCache bo
 	p.buildConcurrency = concurrency
 	p.buildProgress = progress
 	os.MkdirAll(cacheDir, 0755)
+
+	// Step 1: Load or build base FSTs (VSIGMA, CHAR, SIGMA, etc.)
+	if !p.tryLoadBaseFst(cacheDir, prefix) {
+		if progress != nil {
+			progress("构建基座FST", 1, 3)
+		}
+		p.buildBaseFst()
+		p.saveBaseFst(cacheDir, prefix)
+	}
 
 	// Initialize cache manager (10 min TTL eviction)
 	p.cache = fstcache.New(cacheDir)
@@ -174,23 +192,78 @@ func (p *Processor) BuildFstWithCache(prefix, cacheDir string, overwriteCache bo
 	}
 
 	if overwriteCache {
-		// Clear both memory and disk cache for this prefix
 		p.cache.Invalidate(prefix + "_tagger")
 		p.cache.Invalidate(prefix + "_verbalizer")
 	}
 
-	// Pre-load tagger and verbalizer into memory via cache
 	if progress != nil {
-		progress("加载Tagger", 1, 2)
+		progress("加载Tagger", 2, 3)
 	}
 	p.Tagger = p.cache.GetOrBuild(prefix+"_tagger", p.taggerBuilder)
 	if progress != nil {
-		progress("加载Verbalizer", 2, 2)
+		progress("加载Verbalizer", 3, 3)
 	}
 	p.Verbalizer = p.cache.GetOrBuild(prefix+"_verbalizer", p.verbalizerBuilder)
 	if progress != nil {
-		progress("完成", 2, 2)
+		progress("完成", 3, 3)
 	}
+}
+
+// tryLoadBaseFst attempts to load all base FSTs from disk cache.
+// Returns true if all were loaded successfully.
+func (p *Processor) tryLoadBaseFst(cacheDir, prefix string) bool {
+	basePath := func(name string) string {
+		return filepath.Join(cacheDir, prefix+"_base_"+name+".fst")
+	}
+	type baseEntry struct {
+		name string
+		dst  **pynini.Fst
+	}
+	entries := []baseEntry{
+		{"vsig", &p.VSIGMA},
+		{"char", &p.CHAR},
+		{"sigma", &p.SIGMA},
+		{"not_quote", &p.NOT_QUOTE},
+		{"not_space", &p.NOT_SPACE},
+		{"to_lower", &p.TO_LOWER},
+		{"to_upper", &p.TO_UPPER},
+		{"insert_space", &p.INSERT_SPACE},
+		{"delete_space", &p.DELETE_SPACE},
+		{"delete_extra_space", &p.DELETE_EXTRA_SPACE},
+		{"delete_zero_one_space", &p.DELETE_ZERO_OR_ONE_SPACE},
+	}
+	for _, e := range entries {
+		fst, err := pynini.FstRead(basePath(e.name))
+		if err != nil {
+			return false
+		}
+		*e.dst = fst
+	}
+	p.baseFstLoaded = true
+	return true
+}
+
+// saveBaseFst saves all base FSTs to disk cache for future use.
+func (p *Processor) saveBaseFst(cacheDir, prefix string) {
+	basePath := func(name string) string {
+		return filepath.Join(cacheDir, prefix+"_base_"+name+".fst")
+	}
+	save := func(name string, fst *pynini.Fst) {
+		if fst != nil {
+			pynini.FstWrite(fst, basePath(name))
+		}
+	}
+	save("vsig", p.VSIGMA)
+	save("char", p.CHAR)
+	save("sigma", p.SIGMA)
+	save("not_quote", p.NOT_QUOTE)
+	save("not_space", p.NOT_SPACE)
+	save("to_lower", p.TO_LOWER)
+	save("to_upper", p.TO_UPPER)
+	save("insert_space", p.INSERT_SPACE)
+	save("delete_space", p.DELETE_SPACE)
+	save("delete_extra_space", p.DELETE_EXTRA_SPACE)
+	save("delete_zero_one_space", p.DELETE_ZERO_OR_ONE_SPACE)
 }
 
 func (p *Processor) BuildFst(prefix, cacheDir string, overwriteCache bool) {

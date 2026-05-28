@@ -10,7 +10,7 @@ import (
 )
 
 func main() {
-	cacheDir := filepath.Join(".cache", "tn", "japanese", "normalizer")
+	cacheDir := filepath.Join("cache", "tn", "japanese", "normalizer")
 	os.MkdirAll(cacheDir, 0755)
 
 	fmt.Println("正在构建 Japanese Normalizer FST（首次运行可能需要较长时间）...")
