@@ -2,7 +2,6 @@ package pynini
 
 import (
 	"encoding/gob"
-	"math"
 	"os"
 	"strings"
 )
@@ -110,14 +109,14 @@ func Cross(a, b interface{}) *Fst {
 		return crossFstFst(aFst, bFst)
 	}
 	if aIsFst {
-		return crossFstString(aFst, labelStringSafe(aFst), labelStringSafe(bFst))
+		return crossFstString(aFst, labelStringSafe(aFst), labelStringSafe(b))
 	}
 	if bIsFst {
-		return crossFstString(bFst, labelStringSafe(aFst), labelStringSafe(bFst))
+		return crossFstString(bFst, labelStringSafe(a), labelStringSafe(bFst))
 	}
 
-	aStr, _ := a.(string)
-	bStr, _ := b.(string)
+	aStr := toString(a)
+	bStr := toString(b)
 	if aStr == "" && bStr == "" {
 		f := NewFst()
 		f.States[0].Final = true
@@ -125,6 +124,15 @@ func Cross(a, b interface{}) *Fst {
 	}
 
 	return crossFromStrings(aStr, bStr)
+}
+
+func toString(label interface{}) string {
+	switch v := label.(type) {
+	case string:
+		return v
+	default:
+		return ""
+	}
 }
 
 func crossFromStrings(aStr, bStr string) *Fst {
@@ -233,8 +241,6 @@ func (f *Fst) Compose(other *Fst) *Fst {
 		return NewFst()
 	}
 
-	// Composition via cross-product of states.
-	// State (s1, s2) in result corresponds to being in state s1 of f and s2 of other.
 	type pair struct {
 		s1, s2 int
 	}
@@ -258,19 +264,16 @@ func (f *Fst) Compose(other *Fst) *Fst {
 			continue
 		}
 
-		// Check if both states are final -> result state is final
 		if s1.Final && s2.Final {
 			result.SetFinal(resultStateID, s1.Weight+s2.Weight)
 		}
 
-		// Build arc index for s2
 		s2Arcs := make(map[string][]*Arc)
 		for _, arc := range s2.Arcs {
 			s2Arcs[arc.ILabel] = append(s2Arcs[arc.ILabel], arc)
 		}
 
 		for _, a1 := range s1.Arcs {
-			// Find matching arcs in s2 where s2's input matches s1's output
 			if arcs, ok := s2Arcs[a1.OLabel]; ok {
 				for _, a2 := range arcs {
 					np := pair{s1: a1.Next, s2: a2.Next}
@@ -285,7 +288,6 @@ func (f *Fst) Compose(other *Fst) *Fst {
 					result.AddArc(resultStateID, npID, a1.ILabel, a2.OLabel, a1.Weight+a2.Weight)
 				}
 			}
-			// Epsilon on output of a1: advance only f (s1 side)
 			if a1.OLabel == "" {
 				np := pair{s1: a1.Next, s2: p.s2}
 				npID, seen := visited[np]
@@ -300,7 +302,6 @@ func (f *Fst) Compose(other *Fst) *Fst {
 			}
 		}
 
-		// Epsilon on input of s2: advance only other (s2 side)
 		for _, a2 := range s2.Arcs {
 			if a2.ILabel == "" {
 				np := pair{s1: p.s1, s2: a2.Next}
@@ -748,13 +749,97 @@ func maxStateID(f *Fst) int {
 	return maxID
 }
 
+// ShortestPath uses Dijkstra's algorithm to find the path with minimum
+// total weight from start to a final state, returning the concatenated output labels.
+func (f *Fst) ShortestPath() string {
+	if f == nil {
+		return ""
+	}
+
+	type node struct {
+		state  int
+		output string
+		weight float64
+	}
+
+	pq := []node{{state: f.Start, output: "", weight: 0}}
+	best := map[int]float64{f.Start: 0}
+
+	for len(pq) > 0 {
+		minIdx := 0
+		for i := 1; i < len(pq); i++ {
+			if pq[i].weight < pq[minIdx].weight {
+				minIdx = i
+			}
+		}
+		cur := pq[minIdx]
+		pq = append(pq[:minIdx], pq[minIdx+1:]...)
+
+		if cur.weight > best[cur.state] {
+			continue
+		}
+
+		st := f.States[cur.state]
+		if st == nil {
+			continue
+		}
+
+		if st.Final {
+			return cur.output
+		}
+
+		for _, arc := range st.Arcs {
+			nw := cur.weight + arc.Weight
+			no := cur.output + arc.OLabel
+			if prev, ok := best[arc.Next]; !ok || nw < prev {
+				best[arc.Next] = nw
+				pq = append(pq, node{state: arc.Next, output: no, weight: nw})
+			}
+		}
+	}
+
+	return ""
+}
+
 // ComposeShortestPath returns the shortest output string by composing
-// this FST with other and finding the shortest path.
+// this FST with other and finding the shortest path in the composed result.
 func (f *Fst) ComposeShortestPath(other *Fst) string {
-	return ComposeInputWithFst("", f, other)
+	if f == nil || other == nil {
+		return ""
+	}
+	composed := f.Compose(other)
+	return composed.ShortestPath()
+}
+
+// extractLinearInput extracts the concatenated ILabels from a
+// linear-chain acceptor FST.
+func extractLinearInput(f *Fst) string {
+	if f == nil {
+		return ""
+	}
+	var sb strings.Builder
+	state := f.Start
+	visited := make(map[int]bool)
+	for {
+		if visited[state] {
+			break
+		}
+		visited[state] = true
+		st := f.States[state]
+		if st == nil || len(st.Arcs) == 0 {
+			break
+		}
+		a := st.Arcs[0]
+		sb.WriteString(a.ILabel)
+		state = a.Next
+	}
+	return sb.String()
 }
 
 // ComposeInputWithFst composes input with the FST and returns the shortest output.
+// Uses on-the-fly composition: walks through the product space matching input
+// characters against the FST's ILabels, collecting OLabels along the way,
+// and following epsilon chains with Dijkstra-like tiebreaking.
 func ComposeInputWithFst(inputStr string, f *Fst, other *Fst) string {
 	if other == nil {
 		return ""
@@ -765,19 +850,7 @@ func ComposeInputWithFst(inputStr string, f *Fst, other *Fst) string {
 		if f == nil {
 			return ""
 		}
-		var sb strings.Builder
-		state := f.Start
-		for {
-			st := f.States[state]
-			if st == nil || len(st.Arcs) == 0 {
-				break
-			}
-			for _, arc := range st.Arcs {
-				sb.WriteString(arc.ILabel)
-				state = arc.Next
-			}
-		}
-		input = sb.String()
+		input = extractLinearInput(f)
 	}
 
 	runes := []rune(input)
@@ -785,204 +858,143 @@ func ComposeInputWithFst(inputStr string, f *Fst, other *Fst) string {
 		return ""
 	}
 
-	nStates := len(other.States)
-	const epsilonPenalty = 2.0
-
-	type matchTarget struct {
-		src    int
-		weight float64
-		next   int
+	type entry struct {
 		output string
-	}
-	matchIndex := make(map[string][]matchTarget)
-	for s2, st := range other.States {
-		if st == nil {
-			continue
-		}
-		for _, arc := range st.Arcs {
-			if arc.ILabel != "" {
-				matchIndex[arc.ILabel] = append(matchIndex[arc.ILabel], matchTarget{
-					src: s2, weight: arc.Weight, next: arc.Next, output: arc.OLabel,
-				})
-			}
-		}
+		weight float64
 	}
 
-	type beamSlice struct {
-		weights []float64
-		outputs []string
+	posBest := make([]map[int]entry, len(runes)+1)
+	for i := range posBest {
+		posBest[i] = make(map[int]entry)
 	}
-	newBeam := func() beamSlice {
-		w := make([]float64, nStates)
-		for i := range w {
-			w[i] = math.NaN()
-		}
-		return beamSlice{weights: w, outputs: make([]string, nStates)}
-	}
+	posBest[0][other.Start] = entry{output: "", weight: 0}
 
-	epsilonClosure := func(beam beamSlice, stateCount int) (beamSlice, int) {
-		visited := make([]float64, nStates)
-		for i := range visited {
-			visited[i] = math.NaN()
+	for pos := 0; pos <= len(runes); pos++ {
+		// BFS-style epsilon closure: follow all epsilon arcs at this position.
+		// Epsilon arcs don't consume input, so we use BFS (FIFO) and
+		// propagate longer outputs eagerly.
+		q := make([]int, 0, len(posBest[pos]))
+		for s := range posBest[pos] {
+			q = append(q, s)
 		}
-		result := newBeam()
-		q := make([]int, nStates)
-		qHead, qTail := 0, 0
-		count := 0
-
-		for s2 := 0; s2 < nStates; s2++ {
-			w := beam.weights[s2]
-			if !math.IsNaN(w) {
-				visited[s2] = w
-				result.weights[s2] = w
-				result.outputs[s2] = beam.outputs[s2]
-				q[qTail] = s2
-				qTail++
-				count++
-			}
-		}
-
-		for qHead < qTail {
-			s2 := q[qHead]
-			qHead++
-			w := visited[s2]
-			o := result.outputs[s2]
-			st := other.States[s2]
+		const maxEpsIter = 10000
+		epsIter := 0
+		for len(q) > 0 && epsIter < maxEpsIter {
+			s := q[0]
+			q = q[1:]
+			cur := posBest[pos][s]
+			st := other.States[s]
 			if st == nil {
 				continue
 			}
 			for _, arc := range st.Arcs {
 				if arc.ILabel == "" {
-					next := arc.Next
-					newW := w + arc.Weight + epsilonPenalty
-					if math.IsNaN(visited[next]) || newW < visited[next] {
-						visited[next] = newW
-						result.weights[next] = newW
-						result.outputs[next] = o + arc.OLabel
-						q[qTail] = next
-						qTail++
-						if math.IsNaN(beam.weights[next]) {
-							count++
+					nw := cur.weight + arc.Weight
+					no := cur.output + arc.OLabel
+					prev, ok := posBest[pos][arc.Next]
+					if !ok || len(no) > len(prev.output) || (len(no) == len(prev.output) && nw < prev.weight) {
+						posBest[pos][arc.Next] = entry{output: no, weight: nw}
+						q = append(q, arc.Next)
+					}
+				}
+			}
+			epsIter++
+		}
+
+		if pos < len(runes) {
+			matchChar := string(runes[pos])
+			for s, cur := range posBest[pos] {
+				st := other.States[s]
+				if st == nil {
+					continue
+				}
+				for _, arc := range st.Arcs {
+					if arc.ILabel == matchChar {
+						nw := cur.weight + arc.Weight
+						no := cur.output + arc.OLabel
+						if prev, ok := posBest[pos+1][arc.Next]; !ok || nw < prev.weight || (nw == prev.weight && len(no) > len(prev.output)) {
+							posBest[pos+1][arc.Next] = entry{output: no, weight: nw}
 						}
 					}
 				}
 			}
 		}
-		return result, count
 	}
 
-	// Initial beam and cache base epsilon closure from start.
-	// For FINAL matched states, the epsilon closure always goes through
-	// Star restart(2.0) → main start → all states, so the result is the
-	// same set (all states) with weights shifted by matchedWeight + 2.0.
-	// We cache this to avoid the O(284K) BFS per character.
-	beam := newBeam()
-	beam.weights[other.Start] = 0
-	beam.outputs[other.Start] = ""
-	baseBeam, _ := epsilonClosure(beam, 1)
-
-	for _, ch := range runes {
-		charStr := string(ch)
-		targets := matchIndex[charStr]
-
-		type mr struct {
-			weight  float64
-			output  string
-			isFinal bool
-		}
-		matched := make(map[int]*mr)
-		bestFinalW := 1e30
-		bestFinalO := ""
-		for _, tgt := range targets {
-			w := beam.weights[tgt.src]
-			if !math.IsNaN(w) {
-				nw := w + tgt.weight
-				no := beam.outputs[tgt.src] + tgt.output
-				if prev, ok := matched[tgt.next]; !ok || nw < prev.weight {
-					st := other.States[tgt.next]
-					matched[tgt.next] = &mr{weight: nw, output: no, isFinal: st != nil && st.Final}
-				}
-			}
-		}
-
-		if len(matched) == 0 {
-			continue
-		}
-
-		nb := newBeam()
-
-		hasFinal := false
-		needBFS := false
-		for _, m := range matched {
-			if m.isFinal {
-				hasFinal = true
-				if m.weight < bestFinalW {
-					bestFinalW = m.weight
-					bestFinalO = m.output
-				}
-			} else {
-				needBFS = true
-			}
-		}
-
-		if hasFinal {
-			for s2 := 0; s2 < nStates; s2++ {
-				bw := baseBeam.weights[s2]
-				if !math.IsNaN(bw) {
-					nb.weights[s2] = bestFinalW + 2.0 + bw
-					nb.outputs[s2] = bestFinalO + baseBeam.outputs[s2]
-				}
-			}
-			for s2, m := range matched {
-				if m.isFinal {
-					nb.weights[s2] = m.weight
-					nb.outputs[s2] = m.output
-				}
-			}
-		}
-
-		if needBFS {
-			bb := newBeam()
-			bc := 0
-			for s2, m := range matched {
-				if !m.isFinal {
-					bb.weights[s2] = m.weight
-					bb.outputs[s2] = m.output
-					bc++
-				}
-			}
-			if bc > 0 {
-				br, _ := epsilonClosure(bb, bc)
-				for s2 := 0; s2 < nStates; s2++ {
-					bw := br.weights[s2]
-					if !math.IsNaN(bw) {
-						if math.IsNaN(nb.weights[s2]) || bw < nb.weights[s2] {
-							nb.weights[s2] = bw
-							nb.outputs[s2] = br.outputs[s2]
-						}
-					}
-				}
-			}
-		}
-
-		beam = nb
-	}
-
-	bestOutput := ""
+	// Find best state at final position: prefer terminal (Final or 0 arcs)
+	// with min weight. Also track the state with longest output for
+	// epsilon chain following.
 	minWeight := 1e30
-	for s2, st := range other.States {
-		if st != nil && st.Final {
-			w := beam.weights[s2]
-			if !math.IsNaN(w) {
-				totalW := w + st.Weight
-				if totalW < minWeight {
-					minWeight = totalW
-					bestOutput = beam.outputs[s2]
-				}
+	bestOutput := ""
+	bestEndState := -1
+	bestOverallState := -1
+	bestOverallOutput := ""
+	for s, cur := range posBest[len(runes)] {
+		st := other.States[s]
+		if st != nil && (st.Final || len(st.Arcs) == 0) {
+			totalW := cur.weight + st.Weight
+			if totalW < minWeight || (totalW == minWeight && len(cur.output) > len(bestOutput)) {
+				minWeight = totalW
+				bestOutput = cur.output
+				bestEndState = s
 			}
+		}
+		if len(cur.output) > len(bestOverallOutput) {
+			bestOverallOutput = cur.output
+			bestOverallState = s
 		}
 	}
 
+	// Follow epsilon chains from the state with longest output
+	// to accumulate trailing output that may not be present in
+	// terminal states (e.g. closing brackets and quotes).
+	epsilonState := bestOverallState
+	epsilonOutput := bestOverallOutput
+	if epsilonState < 0 {
+		epsilonState = bestEndState
+		epsilonOutput = bestOutput
+	}
+
+	if epsilonState >= 0 {
+		type epsEntry struct {
+			state  int
+			output string
+		}
+		const maxEpsFollow = 50000
+		epsBest := epsilonOutput
+		epsVisited := map[int]string{epsilonState: epsilonOutput}
+		epsQ := []epsEntry{{state: epsilonState, output: epsilonOutput}}
+		for len(epsQ) > 0 && len(epsVisited) < maxEpsFollow {
+			be := epsQ[0]
+			epsQ = epsQ[1:]
+			st := other.States[be.state]
+			if st == nil {
+				continue
+			}
+			for _, arc := range st.Arcs {
+				if arc.ILabel == "" {
+					no := be.output + arc.OLabel
+					prev, seen := epsVisited[arc.Next]
+					if !seen || len(no) > len(prev) {
+						epsVisited[arc.Next] = no
+						epsQ = append(epsQ, epsEntry{state: arc.Next, output: no})
+						if len(no) > len(epsBest) {
+							epsBest = no
+						}
+					}
+				}
+			}
+		}
+		if len(epsBest) > len(bestOutput) {
+			bestOutput = epsBest
+		} else if bestEndState < 0 {
+			bestOutput = epsilonOutput
+		}
+	}
+
+	if bestEndState < 0 && len(bestOutput) == 0 {
+		bestOutput = bestOverallOutput
+	}
 	return bestOutput
 }
 
