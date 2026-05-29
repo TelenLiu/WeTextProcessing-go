@@ -350,8 +350,11 @@ func (f *Fst) Concat(other *Fst) *Fst {
 	}
 
 	// Connect each final state of f to the start of other (with offset)
-	for sID, st := range result.States {
-		if st.Final {
+	// Only iterate over f's original states (before other was copied)
+	fSize := maxStateID(f) + 1
+	for sID := 0; sID < fSize; sID++ {
+		st := result.States[sID]
+		if st != nil && st.Final {
 			st.Final = false
 			st.Weight = 0
 			result.AddArc(sID, other.Start+offset, "", "", 0)
@@ -801,14 +804,137 @@ func (f *Fst) ShortestPath() string {
 	return ""
 }
 
+type pqItem struct {
+	pos    int
+	ostate int
+	output string
+	weight float64
+}
+
 // ComposeShortestPath returns the shortest output string by composing
-// this FST with other and finding the shortest path in the composed result.
+// this FST with other using on-the-fly Dijkstra through the product space.
+// f is expected to be a linear-chain acceptor (e.g., Accep(input)).
 func (f *Fst) ComposeShortestPath(other *Fst) string {
 	if f == nil || other == nil {
 		return ""
 	}
-	composed := f.Compose(other)
-	return composed.ShortestPath()
+
+	input := extractLinearInput(f)
+	if input == "" {
+		return ""
+	}
+
+	runes := []rune(input)
+
+	type state struct {
+		pos    int
+		ostate int
+	}
+
+	pq := &minHeap{}
+	pq.push(pqItem{pos: 0, ostate: other.Start, output: "", weight: 0})
+
+	best := make(map[state]float64)
+	best[state{0, other.Start}] = 0
+
+	for pq.len() > 0 {
+		cur := pq.pop()
+		stKey := state{cur.pos, cur.ostate}
+		if cur.weight > best[stKey] {
+			continue
+		}
+
+		ost := other.States[cur.ostate]
+		if ost == nil {
+			continue
+		}
+
+		if cur.pos == len(runes) && ost.Final {
+			return cur.output
+		}
+
+		for _, arc := range ost.Arcs {
+			if arc.ILabel == "" {
+				nw := cur.weight + arc.Weight
+				no := cur.output + arc.OLabel
+				nk := state{cur.pos, arc.Next}
+				if prev, ok := best[nk]; !ok || nw < prev {
+					best[nk] = nw
+					pq.push(pqItem{pos: cur.pos, ostate: arc.Next, output: no, weight: nw})
+				}
+			}
+		}
+
+		if cur.pos < len(runes) {
+			matchChar := string(runes[cur.pos])
+			for _, arc := range ost.Arcs {
+				if arc.ILabel == matchChar {
+					nw := cur.weight + arc.Weight
+					no := cur.output + arc.OLabel
+					nk := state{cur.pos + 1, arc.Next}
+					if prev, ok := best[nk]; !ok || nw < prev {
+						best[nk] = nw
+						pq.push(pqItem{pos: cur.pos + 1, ostate: arc.Next, output: no, weight: nw})
+					}
+				}
+			}
+		}
+	}
+
+	return ""
+}
+
+type minHeap struct {
+	items []pqItem
+}
+
+func (h *minHeap) len() int { return len(h.items) }
+
+func (h *minHeap) push(item pqItem) {
+	h.items = append(h.items, item)
+	h.up(len(h.items) - 1)
+}
+
+func (h *minHeap) pop() pqItem {
+	n := len(h.items)
+	item := h.items[0]
+	h.items[0] = h.items[n-1]
+	h.items = h.items[:n-1]
+	if len(h.items) > 0 {
+		h.down(0)
+	}
+	return item
+}
+
+func (h *minHeap) up(i int) {
+	for i > 0 {
+		p := (i - 1) / 2
+		if h.items[p].weight <= h.items[i].weight {
+			break
+		}
+		h.items[p], h.items[i] = h.items[i], h.items[p]
+		i = p
+	}
+}
+
+func (h *minHeap) down(i int) {
+	n := len(h.items)
+	for {
+		smallest := i
+		l := 2*i + 1
+		r := 2*i + 2
+		if l < n && h.items[l].weight < h.items[smallest].weight {
+			smallest = l
+		}
+		if r < n && h.items[r].weight < h.items[smallest].weight {
+			smallest = r
+		}
+		if smallest == i {
+			break
+		}
+		h.items[i], h.items[smallest] = h.items[smallest], h.items[i]
+		i = smallest
+	}
 }
 
 // extractLinearInput extracts the concatenated ILabels from a
