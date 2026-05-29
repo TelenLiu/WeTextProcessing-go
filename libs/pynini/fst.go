@@ -103,9 +103,31 @@ func Accep(s string) *Fst {
 // and output labels are from string b. If a or b is *Fst, it extracts the
 // string labels from the FST.
 func Cross(a, b interface{}) *Fst {
-	aStr := labelString(a)
-	bStr := labelString(b)
+	aFst, aIsFst := a.(*Fst)
+	bFst, bIsFst := b.(*Fst)
 
+	if aIsFst && bIsFst {
+		return crossFstFst(aFst, bFst)
+	}
+	if aIsFst {
+		return crossFstString(aFst, labelStringSafe(aFst), labelStringSafe(bFst))
+	}
+	if bIsFst {
+		return crossFstString(bFst, labelStringSafe(aFst), labelStringSafe(bFst))
+	}
+
+	aStr, _ := a.(string)
+	bStr, _ := b.(string)
+	if aStr == "" && bStr == "" {
+		f := NewFst()
+		f.States[0].Final = true
+		return f
+	}
+
+	return crossFromStrings(aStr, bStr)
+}
+
+func crossFromStrings(aStr, bStr string) *Fst {
 	if aStr == "" && bStr == "" {
 		f := NewFst()
 		f.States[0].Final = true
@@ -138,22 +160,49 @@ func Cross(a, b interface{}) *Fst {
 	return f
 }
 
-// labelString extracts the string representation of a label.
-func labelString(label interface{}) string {
+func crossFstFst(a, b *Fst) *Fst {
+	if a == nil || b == nil {
+		return NewFst()
+	}
+	aProj := Project(a, "input")
+	bProj := Project(b, "output")
+	return aProj.Compose(bProj)
+}
+
+func crossFstString(fst *Fst, aStr, bStr string) *Fst {
+	return crossFromStrings(aStr, bStr)
+}
+
+func labelStringSafe(label interface{}) string {
 	switch v := label.(type) {
 	case string:
 		return v
 	case *Fst:
+		if v == nil {
+			return ""
+		}
+		visited := make(map[int]bool)
 		var sb strings.Builder
 		state := v.Start
 		for {
+			if visited[state] {
+				break
+			}
+			visited[state] = true
 			st := v.States[state]
 			if st == nil || len(st.Arcs) == 0 {
 				break
 			}
+			nonEpsilon := false
 			for _, arc := range st.Arcs {
-				sb.WriteString(arc.ILabel)
-				state = arc.Next
+				if arc.ILabel != "" {
+					sb.WriteString(arc.ILabel)
+					state = arc.Next
+					nonEpsilon = true
+				}
+			}
+			if !nonEpsilon {
+				break
 			}
 		}
 		return sb.String()

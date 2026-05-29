@@ -3,7 +3,6 @@ package tn
 import (
 	"os"
 	"path/filepath"
-	"sync"
 	"time"
 
 	"github.com/TelenLiu/WeTextProcessing-go/fstcache"
@@ -73,16 +72,7 @@ func NewProcessor(name string, ordertype ...string) *Processor {
 		UPPER:      lib.UPPER,
 		MIN_NEG_WEIGHT: -0.0001,
 	}
-	return p
-}
-
-// buildBaseFst constructs all base FSTs from scratch (expensive, ~80% of build time).
-func (p *Processor) buildBaseFst() {
-	if p.baseFstLoaded {
-		return
-	}
-	p.baseFstLoaded = true
-
+	// Build all base FSTs inline (matching Python Processor.__init__ behavior)
 	p.VSIGMA = p.VCHAR.Star()
 	CHAR := p.VCHAR.Difference(pynini.Union(pynini.Accep("\\"), pynini.Accep("\"")))
 	p.CHAR = pynini.Union(
@@ -96,33 +86,33 @@ func (p *Processor) buildBaseFst() {
 		pynini.Cross("\\\"", "\""),
 	)
 	p.SIGMA = sigmaBase.Star()
+	p.NOT_QUOTE = p.VCHAR.Difference(pynini.Accep("\""))
+	p.NOT_SPACE = p.VCHAR.Difference(p.SPACE)
 
-	var wg sync.WaitGroup
-	wg.Add(3)
-	var notQuote, notSpace, toLower *pynini.Fst
-	go func() { notQuote = p.VCHAR.Difference(pynini.Accep("\"")); wg.Done() }()
-	go func() { notSpace = p.VCHAR.Difference(p.SPACE); wg.Done() }()
-	go func() {
-		lower := "abcdefghijklmnopqrstuvwxyz"
-		upper := "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-		var fsts []*pynini.Fst
-		for i := 0; i < len(lower); i++ {
-			fsts = append(fsts, pynini.Cross(string(upper[i]), string(lower[i])))
-		}
-		toLower = pynini.Union(fsts...)
-		wg.Done()
-	}()
+	lower := "abcdefghijklmnopqrstuvwxyz"
+	upper := "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+	var fsts []*pynini.Fst
+	for i := 0; i < len(lower); i++ {
+		fsts = append(fsts, pynini.Cross(string(upper[i]), string(lower[i])))
+	}
+	p.TO_LOWER = pynini.Union(fsts...)
+	p.TO_UPPER = p.TO_LOWER.Invert()
 
 	p.INSERT_SPACE = lib.Insert(" ")
 	p.DELETE_SPACE = lib.Delete(p.SPACE).Star()
 	p.DELETE_EXTRA_SPACE = pynini.Cross(p.SPACE.Plus(), pynini.Accep(" "))
 	p.DELETE_ZERO_OR_ONE_SPACE = lib.Delete(p.SPACE).Ques()
 
-	wg.Wait()
-	p.NOT_QUOTE = notQuote
-	p.NOT_SPACE = notSpace
-	p.TO_LOWER = toLower
-	p.TO_UPPER = toLower.Invert()
+	p.baseFstLoaded = true
+	return p
+}
+
+// buildBaseFst is a no-op now; base FSTs are built in NewProcessor.
+func (p *Processor) buildBaseFst() {
+	if p.baseFstLoaded {
+		return
+	}
+	p.baseFstLoaded = true
 }
 
 func (p *Processor) BuildRule(fst *pynini.Fst, l, r string) *pynini.Fst {
