@@ -15,7 +15,6 @@ var (
 	GRAPH = buildCharUnion("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
 
 	// BYTE: union of all byte values 1-255.
-	// Built at init time since it requires 255 Accep calls.
 	BYTE = buildByte()
 
 	// NOT_SPACE and NOT_QUOTE use optimized Difference path
@@ -28,24 +27,20 @@ var (
 // This allows isCharUnion() to detect it and use the optimized Difference path.
 func buildCharUnion(chars string) *pynini.Fst {
 	result := pynini.NewFst()
-	stateID := 1
 	for _, ch := range chars {
-		result.AddState(stateID)
+		stateID := result.AddState()
 		result.SetFinal(stateID, 0)
-		result.AddArc(0, stateID, string(ch), string(ch), 0)
-		stateID++
+		result.AddArcStr(0, stateID, string(ch), string(ch), 0)
 	}
 	return result
 }
 
 func buildByte() *pynini.Fst {
 	result := pynini.NewFst()
-	stateID := 1
 	for i := 1; i < 256; i++ {
-		result.AddState(stateID)
+		stateID := result.AddState()
 		result.SetFinal(stateID, 0)
-		result.AddArc(0, stateID, string(rune(i)), string(rune(i)), 0)
-		stateID++
+		result.AddArcStr(0, stateID, string(rune(i)), string(rune(i)), 0)
 	}
 	return result
 }

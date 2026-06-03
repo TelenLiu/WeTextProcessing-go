@@ -28,6 +28,12 @@ func NewInverseNormalizer(
 	enable_million bool,
 	progress ...tn.BuildProgressFn,
 ) *InverseNormalizer {
+	// Extend global VCHAR with CJK characters for Chinese text processing.
+	// This must be done before any Processor is created (including rules).
+	charsetPath := tn.ChineseDataPath("data/char/charset_national_standard_2013_8105.tsv")
+	if charsetPath != "" {
+		lib.ExtendValidUTF8Char(charsetPath)
+	}
 	n := &InverseNormalizer{
 		Processor:                tn.NewProcessor("zh_inverse_normalizer", "itn"),
 		remove_interjections:     remove_interjections,

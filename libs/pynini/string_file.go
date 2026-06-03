@@ -6,6 +6,8 @@ import (
 	"strings"
 )
 
+// StringFile reads a TSV file and creates a union FST from the mappings.
+// Each line: input\toutput or just input (for acceptor).
 func StringFile(path string) (*Fst, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -32,6 +34,7 @@ func StringFile(path string) (*Fst, error) {
 	return Union(fsts...), nil
 }
 
+// StringFileMust reads a TSV file and creates a union FST, panicking on error.
 func StringFileMust(path string) *Fst {
 	fst, err := StringFile(path)
 	if err != nil {
@@ -40,6 +43,7 @@ func StringFileMust(path string) *Fst {
 	return fst
 }
 
+// StringMap creates a union FST from a slice of string pairs.
 func StringMap(mappings [][]string) *Fst {
 	var fsts []*Fst
 	for _, pair := range mappings {

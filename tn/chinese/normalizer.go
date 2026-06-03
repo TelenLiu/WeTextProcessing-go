@@ -46,6 +46,12 @@ func NewNormalizer(
 	tag_oov bool,
 	progress ...tn.BuildProgressFn,
 ) *Normalizer {
+	// Extend global VCHAR with CJK characters for Chinese text processing.
+	// This must be done before any Processor is created (including rules).
+	charsetPath := tn.ChineseDataPath("data/char/charset_national_standard_2013_8105.tsv")
+	if charsetPath != "" {
+		lib.ExtendValidUTF8Char(charsetPath)
+	}
 	n := &Normalizer{
 		Processor:            tn.NewProcessor("zh_normalizer"),
 		remove_interjections: remove_interjections,

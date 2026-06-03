@@ -1,6 +1,9 @@
 package rules
 
 import (
+	"bufio"
+	"os"
+
 	"github.com/TelenLiu/WeTextProcessing-go/libs/pynini"
 	"github.com/TelenLiu/WeTextProcessing-go/libs/pynini/lib"
 	"github.com/TelenLiu/WeTextProcessing-go/tn"
@@ -8,12 +11,12 @@ import (
 
 type Cardinal struct {
 	*tn.Processor
-	Graph                                                          *pynini.Fst
-	GraphWithAnd                                                   *pynini.Fst
-	GraphHundredComponentAtLeastOneNoneZeroDigit                   *pynini.Fst
-	SingleDigitsGraph                                              *pynini.Fst
-	LongNumbers                                                    *pynini.Fst
-	deterministic                                                  bool
+	Graph                                        *pynini.Fst
+	GraphWithAnd                                 *pynini.Fst
+	GraphHundredComponentAtLeastOneNoneZeroDigit *pynini.Fst
+	SingleDigitsGraph                            *pynini.Fst
+	LongNumbers                                  *pynini.Fst
+	deterministic                                bool
 }
 
 func NewCardinal(args ...bool) *Cardinal {
@@ -22,7 +25,7 @@ func NewCardinal(args ...bool) *Cardinal {
 		deterministic = args[0]
 	}
 	c := &Cardinal{
-		Processor:   tn.NewProcessor("cardinal", "en_tn"),
+		Processor:     tn.NewProcessor("cardinal", "en_tn"),
 		deterministic: deterministic,
 	}
 	c.BuildTagger()
@@ -31,189 +34,148 @@ func NewCardinal(args ...bool) *Cardinal {
 }
 
 func (c *Cardinal) BuildTagger() {
-	graph_teen, _ := pynini.StringFile(tn.EnglishDataPath("data/number/teen.tsv"))
-	graph_zero, _ := pynini.StringFile(tn.EnglishDataPath("data/number/zero.tsv"))
 	graph_digit, _ := pynini.StringFile(tn.EnglishDataPath("data/number/digit.tsv"))
+	graph_zero, _ := pynini.StringFile(tn.EnglishDataPath("data/number/zero.tsv"))
+	graph_teen, _ := pynini.StringFile(tn.EnglishDataPath("data/number/teen.tsv"))
 	graph_ty, _ := pynini.StringFile(tn.EnglishDataPath("data/number/ty.tsv"))
-	graph_thousand, _ := pynini.StringFile(tn.EnglishDataPath("data/number/thousand.tsv"))
-	_ = graph_thousand
 
-	// single digit component: 0-9 (text -> digit)
-	single_digits := pynini.Union(graph_zero, graph_digit)
-	// tens component: 20, 30, ..., 90 (text -> digit)
-	ties_graph := graph_ty
-	// tens with optional ones: 20-99 (text -> digit)
-	ties_and_ones := pynini.Union(
-		ties_graph,
-		ties_graph.Concat(lib.Insert(" ")).Concat(graph_digit),
+	digit_t := pynini.Union(graph_digit, graph_zero).Invert()
+	teen_t := graph_teen.Invert()
+	ty_t := graph_ty.Invert()
+
+	ones := digit_t
+	teens := teen_t
+	twenties := ty_t
+	tens := pynini.Union(
+		twenties.Concat(lib.DeleteString("0")),
+		lib.AddWeight(twenties.Concat(lib.Insert(" ")).Concat(ones), 0.01),
 	)
-	// full 0-99 (text -> digit)
-	two_digits := pynini.Union(single_digits, graph_teen, ties_and_ones)
-	// digit -> text (inverted for composition with digitPattern)
-	two_digits_inv := two_digits.Invert()
+	two_digits := pynini.Union(ones, teens, tens).Optimize()
+	two_digits_with_zero := pynini.Union(lib.DeleteString("0").Concat(ones), two_digits)
 
-	// hundred component (digit -> text)
-	hundred_component_inv := two_digits_inv.Concat(
+	hundred_wa := pynini.Union(
+		digit_t.Concat(lib.Insert(" hundred")).Concat(lib.DeleteString("0").Repeat(2)),
+		lib.AddWeight(digit_t.Concat(lib.Insert(" hundred and ")).Concat(two_digits_with_zero), 0.02),
+	)
+	zero3 := lib.DeleteString("0").Repeat(3)
+	last_grp := pynini.Union(two_digits, hundred_wa, lib.AddWeight(zero3, -0.01)).Optimize()
+	hundred_wo := pynini.Union(
+		digit_t.Concat(lib.Insert(" hundred")).Concat(lib.DeleteString("0").Repeat(2)),
+		lib.AddWeight(digit_t.Concat(lib.Insert(" hundred ")).Concat(two_digits_with_zero), 0.02),
+	)
+	higher := pynini.Union(two_digits, hundred_wo, lib.AddWeight(zero3, -0.01)).Optimize()
+
+	c.Graph = last_grp
+	c.GraphWithAnd = last_grp
+
+	// Build 3-digit input patterns that handle leading zeros in intermediate groups.
+	// The original 3-digit composition doesn't handle "024" -> "twenty four",
+	// because "024" goes through hundred_wa -> "zero hundred and twenty four".
+	// We add leading-zero deletion variants to fix this.
+	dig3 := c.DIGIT.Concat(c.DIGIT).Concat(c.DIGIT)
+	// "0XX" -> delete leading zero, match 2 digits
+	dig3_del1 := lib.DeleteString("0").Concat(c.DIGIT).Concat(c.DIGIT)
+	// "00X" -> delete 2 leading zeros, match 1 digit
+	dig3_del2 := lib.DeleteString("0").Repeat(2).Concat(c.DIGIT)
+	dig3_all := pynini.Union(dig3, dig3_del1, dig3_del2, lib.DeleteString("0").Repeat(3))
+	d3 := dig3_all.Compose(higher)
+	d2 := c.DIGIT.Concat(c.DIGIT).Compose(higher)
+	d1_nz := pynini.Union(
+		pynini.Accep("1"), pynini.Accep("2"), pynini.Accep("3"),
+		pynini.Accep("4"), pynini.Accep("5"), pynini.Accep("6"),
+		pynini.Accep("7"), pynini.Accep("8"), pynini.Accep("9"),
+	).Compose(higher)
+	d3_last := dig3_all.Compose(last_grp)
+	// For "and" tail: remainder must be non-zero and less than 100
+	// We exclude all-zeros patterns to avoid "one thousand and zero"
+	nonZeroDigit := c.DIGIT.Difference(pynini.Accep("0"))
+	// "0XX" with at least one non-zero in XX
+	dig3_del1_nz := lib.DeleteString("0").Concat(
 		pynini.Union(
-			lib.Insert(" hundred"),
-			lib.Insert(" hundred ").Concat(two_digits_inv),
+			nonZeroDigit.Concat(c.DIGIT),
+			pynini.Accep("0").Concat(nonZeroDigit),
 		),
 	)
-	// ensure at least one non-zero digit: 2-3 digits OR single non-zero digit
+	// "00X" with non-zero X
+	dig3_del2_nz := lib.DeleteString("0").Repeat(2).Concat(nonZeroDigit)
+	dig3_all_nz := pynini.Union(dig3, dig3_del1_nz, dig3_del2_nz)
+	d3_last_no_hundred := dig3_all_nz.Compose(two_digits)
+
+	allLevels := []*pynini.Fst{last_grp}
+	intermediate := d3_last
+
+	names := readThousandNames()
+	// Limit to 5 levels for performance (thousand -> quadrillion)
+	if len(names) > 5 {
+		names = names[:5]
+	}
+	for i, name := range names {
+		// Without "and"
+		l1 := lib.AddWeight(d1_nz.Concat(lib.Insert(" "+name+" ")).Concat(intermediate), 0.01)
+		l2 := lib.AddWeight(d2.Concat(lib.Insert(" "+name+" ")).Concat(intermediate), 0.01)
+		l3 := lib.AddWeight(d3.Concat(lib.Insert(" "+name+" ")).Concat(intermediate), 0.01)
+
+		// With "and" - only for thousand level, remainder must be < 100 and non-zero
+		var level *pynini.Fst
+		if i == 0 {
+			l1_and := d1_nz.Concat(lib.Insert(" " + name + " and ")).Concat(d3_last_no_hundred)
+			l2_and := d2.Concat(lib.Insert(" " + name + " and ")).Concat(d3_last_no_hundred)
+			l3_and := d3.Concat(lib.Insert(" " + name + " and ")).Concat(d3_last_no_hundred)
+			level = pynini.Union(l1, l2, l3, l1_and, l2_and, l3_and).Optimize()
+		} else {
+			level = pynini.Union(l1, l2, l3).Optimize()
+		}
+
+		intermediate = d3.Concat(lib.Insert(" " + name + " ")).Concat(intermediate).Optimize()
+		allLevels = append(allLevels, pynini.Union(allLevels[i], level).Optimize())
+	}
+
+	all := allLevels[len(allLevels)-1]
+
+	c.SingleDigitsGraph = lib.AddWeight(
+		digit_t.Concat(lib.Insert(" ").Concat(digit_t).Star()), 0.1,
+	)
+
+	// Tagger: positive: "value: ...", negative: "negative: true value: ..."
+	posTag := lib.Insert("value: \"").Concat(all).Concat(lib.Insert("\""))
+	negTag := pynini.Cross("-", "negative: \"true\" ").Concat(
+		lib.Insert("value: \"").Concat(all).Concat(lib.Insert("\"")),
+	)
+	tagger := pynini.Union(posTag, negTag)
+	c.Tagger = c.AddTokens(tagger)
+
 	atLeastOneNonzero := pynini.Union(
 		c.DIGIT.Concat(c.DIGIT),
 		c.DIGIT.Concat(c.DIGIT).Concat(c.DIGIT),
 		c.DIGIT.Difference(pynini.Accep("0")),
 	)
-	c.GraphHundredComponentAtLeastOneNoneZeroDigit = atLeastOneNonzero.Compose(hundred_component_inv)
-
-	// Build main graph for numbers like 1,234,567 or 1234567
-	// Pattern: (1-3 digits)((comma + 3 digits)* | (3 digits)*)
-	digit1to3 := pynini.Union(
-		c.DIGIT,
-		c.DIGIT.Concat(c.DIGIT),
-		c.DIGIT.Concat(c.DIGIT).Concat(c.DIGIT),
-	)
-	comma3digits := lib.DeleteString(",").Concat(c.DIGIT).Concat(c.DIGIT).Concat(c.DIGIT)
-	digitPattern := digit1to3.Concat(
-		pynini.Union(
-			comma3digits.Star(),
-			c.DIGIT.Concat(c.DIGIT).Concat(c.DIGIT).Star(),
-		),
-	)
-
-	c.Graph = digitPattern.Compose(hundred_component_inv).Optimize()
-
-	graph_au := c.AddOptionalAnd(c.Graph)
-
-	// single digits graph: "123" -> "one two three" (for long numbers)
-	singleDigitsGraph := graph_digit.Union(graph_zero).Invert()
-	c.SingleDigitsGraph = singleDigitsGraph.Concat(
-		lib.Insert(" ").Concat(singleDigitsGraph).Star(),
-	)
-
-	var finalGraph *pynini.Fst
-	if c.deterministic {
-		longNumbers := c.DIGIT.Repeat(5).Compose(
-			c.SingleDigitsGraph,
-		).Optimize()
-		c.GraphWithAnd = c.AddOptionalAnd(c.Graph)
-		longNumbers = pynini.Union(longNumbers, c.GraphWithAnd).Optimize()
-		cardinalWithLeadingZeros := pynini.Accep("0").Concat(c.DIGIT.Star()).Compose(
-			c.SingleDigitsGraph,
-		)
-		finalGraph = longNumbers.Union(cardinalWithLeadingZeros)
-		finalGraph = finalGraph.Union(graph_au)
-	} else {
-		leadingZeros := pynini.Accep("0").Plus().Compose(
-			c.SingleDigitsGraph,
-		)
-		c.GraphWithAnd = c.AddOptionalAnd(c.Graph)
-		cardinalWithLeadingZeros := leadingZeros.Concat(
-			lib.Insert(" ")).Concat(
-			c.DIGIT.Star().Compose(c.GraphWithAnd),
-		)
-		longNumbers := c.GraphWithAnd.Union(
-			lib.AddWeight(c.SingleDigitsGraph, 0.0001),
-		)
-		finalGraph = pynini.Union(
-			longNumbers,
-			cardinalWithLeadingZeros,
-		).Optimize()
-
-		// one to a replacement
-		oneToA := pynini.Union(
-			pynini.Cross("one hundred", "a hundred"),
-			pynini.Cross("one thousand", "thousand"),
-			pynini.Cross("one million", "a million"),
-		)
-		finalGraph = finalGraph.Union(
-			finalGraph.Compose(
-				oneToA.Optimize().Concat(c.VCHAR.Star()),
-			).Optimize(),
-		)
-		// remove commas for 4 digit numbers
-		fourDigitComma := c.DIGIT.Difference(pynini.Accep("0")).Concat(
-			lib.DeleteString(",")).Concat(
-			c.DIGIT.Concat(c.DIGIT).Concat(c.DIGIT),
-		)
-		finalGraph = finalGraph.Union(
-			fourDigitComma.Optimize().Compose(finalGraph).Optimize(),
-		)
-	}
-
-	optionalMinus := lib.Insert("negative: \"").Concat(
-		pynini.Cross("-", "true\" "),
-	).Ques()
-	finalGraph = optionalMinus.Concat(
-		lib.Insert("integer: \"").Concat(finalGraph).Concat(lib.Insert("\"")),
-	)
-	c.Tagger = c.AddTokens(finalGraph)
-}
-
-func (c *Cardinal) AddOptionalAnd(graph *pynini.Fst) *pynini.Fst {
-	graphWithAnd := lib.AddWeight(graph, 0.00001)
-	notQuote := c.NOT_QUOTE.Star()
-
-	// no thousand/million context
-	noThousandMillion := notQuote.Difference(
-		notQuote.Concat(
-			pynini.Union(pynini.Accep("thousand"), pynini.Accep("million")).Concat(notQuote),
-		),
-	).Optimize()
-
-	integer := notQuote.Concat(
-		lib.AddWeight(
-			pynini.Cross("hundred ", "hundred and ").Concat(noThousandMillion),
-			-0.0001,
-		),
-	).Optimize()
-
-	// no hundred context
-	noHundred := c.VCHAR.Star().Difference(
-		notQuote.Concat(pynini.Accep("hundred").Concat(notQuote)),
-	).Optimize()
-	integer = integer.Union(
-		notQuote.Concat(
-			lib.AddWeight(
-				pynini.Cross("thousand ", "thousand and ").Concat(noHundred),
-				-0.0001,
-			),
-		),
-	).Optimize()
-
-	// optional hundred: 3 digits without leading zero
-	optionalHundred := c.DIGIT.Difference(pynini.Accep("0")).Repeat(3)
-	optionalHundred = optionalHundred.Compose(graph).Optimize()
-	optionalHundred = optionalHundred.Compose(
-		c.VCHAR.Star().Concat(
-			pynini.Cross(" hundred", "")).Concat(c.VCHAR.Star()),
-	)
-
-	graphWithAnd = graph.Compose(integer).Optimize().Union(graphWithAnd)
-	graphWithAnd = graphWithAnd.Union(optionalHundred)
-	return graphWithAnd
+	c.GraphHundredComponentAtLeastOneNoneZeroDigit = atLeastOneNonzero.Compose(last_grp).Optimize()
+	c.LongNumbers = c.SingleDigitsGraph
 }
 
 func (c *Cardinal) BuildVerbalizer() {
 	optionalSign := pynini.Cross("negative: \"true\"", "minus ")
-	if !c.deterministic {
-		optionalSign = optionalSign.Union(
-			pynini.Cross("negative: \"true\"", "negative "),
-		).Union(
-			pynini.Cross("negative: \"true\"", "dash "),
-		)
-	}
-
 	optionalSign = (optionalSign.Concat(c.DELETE_SPACE)).Ques()
-
 	integer := c.DELETE_SPACE.Concat(
-		lib.DeleteString("\"").Concat(
-			c.NOT_QUOTE.Star()).Concat(lib.DeleteString("\"")),
+		lib.DeleteString("\"").Concat(c.NOT_QUOTE.Star()).Concat(lib.DeleteString("\"")),
 	)
-	integer = lib.DeleteString("integer:").Concat(integer)
+	integer = lib.DeleteString("value:").Concat(integer)
+	c.Verbalizer = c.DeleteTokens(optionalSign.Concat(integer)).Optimize()
+}
 
-	numbers := optionalSign.Concat(integer)
-	deleteTokens := c.DeleteTokens(numbers)
-	c.Verbalizer = deleteTokens.Optimize()
+func readThousandNames() []string {
+	f, err := os.Open(tn.EnglishDataPath("data/number/thousand.tsv"))
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	var names []string
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if len(line) > 0 && line != "hundred" {
+			names = append(names, line)
+		}
+	}
+	return names
 }

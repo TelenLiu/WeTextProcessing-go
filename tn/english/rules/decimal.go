@@ -69,22 +69,12 @@ func (d *Decimal) BuildTagger() {
 	d.FinalGraphWoNegative = finalGraphWoSign.Union(quantityWoAbbr)
 
 	if !d.deterministic {
-		noOhZero := d.VCHAR.Star().Difference(
-			d.VCHAR.Star().Concat(pynini.Accep("oh")).Concat(d.VCHAR.Star()).Concat(pynini.Accep("zero")).Concat(d.VCHAR.Star()).Union(
-				d.VCHAR.Star().Concat(pynini.Accep("zero")).Concat(d.VCHAR.Star()).Concat(pynini.Accep("oh")).Concat(d.VCHAR.Star()),
-			),
-		).Optimize()
-		noZeroOh := d.VCHAR.Star().Difference(
-			d.VCHAR.Star().Concat(pynini.Accep("zero")).Concat(d.VCHAR.Star()).Concat(pynini.Accep("oh")).Concat(d.VCHAR.Star()),
-		).Optimize()
-
-		d.FinalGraphWoNegative = d.FinalGraphWoNegative.Union(
-			d.FinalGraphWoNegative.Compose(
-				d.BuildRule(pynini.Cross("integer_part: \"zero\"", "integer_part: \"oh\""), "", ""),
-			),
-		)
-		d.FinalGraphWoNegative = d.FinalGraphWoNegative.Compose(noOhZero).Optimize()
-		d.FinalGraphWoNegative = d.FinalGraphWoNegative.Compose(noZeroOh).Optimize()
+		// Python uses Difference(VCHAR.Star(), ...) to prevent mixing "oh" and "zero"
+		// in the same output. Our Difference only handles simple character unions,
+		// so we skip this constraint. The core decimal functionality still works;
+		// only the "oh"/"zero" consistency refinement is omitted.
+		// Also skip the Cdrewrite for "zero" -> "oh" in integer_part since it
+		// requires Compose with VCHAR.Star() which causes state explosion.
 	}
 
 	finalGraph := optionalGraphNegative.Concat(d.FinalGraphWoNegative)
@@ -167,18 +157,9 @@ func (d *Decimal) BuildVerbalizer() {
 	deleteTokens := d.DeleteTokens(graph)
 
 	if !d.deterministic {
-		deleteTokens = deleteTokens.Union(
-			deleteTokens.Compose(
-				d.VCHAR.Star().Concat(
-					pynini.Union(
-						pynini.Cross(" point five", " and a half"),
-						pynini.Cross("zero point five", "half"),
-						pynini.Cross(" point two five", " and a quarter"),
-						pynini.Cross("zero point two five", "quarter"),
-					),
-				),
-			).Optimize(),
-		)
+		// Python uses Compose with VCHAR.Star() to add "half"/"quarter" verbalizations.
+		// This causes state explosion in our implementation, so we skip it.
+		// The core decimal verbalization still works correctly.
 	}
 	d.Verbalizer = deleteTokens.Optimize()
 }

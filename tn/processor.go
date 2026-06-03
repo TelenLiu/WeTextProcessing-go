@@ -60,6 +60,12 @@ func NewProcessor(name string, ordertype ...string) *Processor {
 		ot = ordertype[0]
 	}
 
+	// Use CJK-extended VCHAR if available (for Chinese/Japanese processing)
+	vchar := lib.VALID_UTF8_CHAR
+	if cjk := lib.CJKVCHAR(); cjk != nil {
+		vchar = cjk
+	}
+
 	p := &Processor{
 		Name:       name,
 		Ordertype:  ot,
@@ -67,7 +73,7 @@ func NewProcessor(name string, ordertype ...string) *Processor {
 		DIGIT:      lib.DIGIT,
 		PUNCT:      lib.PUNCT,
 		SPACE:      pynini.Union(lib.SPACE, pynini.Accep("\u00A0")),
-		VCHAR:      lib.VALID_UTF8_CHAR,
+		VCHAR:      vchar,
 		LOWER:      lib.LOWER,
 		UPPER:      lib.UPPER,
 		MIN_NEG_WEIGHT: -0.0001,
@@ -317,6 +323,27 @@ func (p *Processor) SetFSTCacheTTL(d time.Duration) {
 	if p.cache != nil {
 		p.cache.SetTTL(d)
 	}
+}
+
+// SetCJKVCHAR extends VCHAR with CJK characters from a charset file
+// (one character per line). After loading, VSIGMA, CHAR, SIGMA, NOT_QUOTE,
+// and NOT_SPACE are rebuilt to include the CJK characters.
+// This is needed for Chinese and Japanese text normalization.
+func (p *Processor) SetCJKVCHAR(charsetPath string) {
+	cjkFst, err := pynini.StringFile(charsetPath)
+	if err != nil || cjkFst == nil {
+		return
+	}
+	// Merge CJK chars into VCHAR
+	p.VCHAR = pynini.Union(p.VCHAR, cjkFst)
+	// Rebuild all derived FSTs
+	p.VSIGMA = p.VCHAR.Star()
+	CHAR := p.VCHAR.Difference(pynini.Union(pynini.Accep("\\"), pynini.Accep("\"")))
+	p.CHAR = pynini.Union(CHAR, pynini.Cross("\\", "\\\\"), pynini.Cross("\"", "\\\""))
+	sigmaBase := pynini.Union(CHAR, pynini.Cross("\\\\", "\\"), pynini.Cross("\\\"", "\""))
+	p.SIGMA = sigmaBase.Star()
+	p.NOT_QUOTE = p.VCHAR.Difference(pynini.Accep("\""))
+	p.NOT_SPACE = p.VCHAR.Difference(p.SPACE)
 }
 
 // FSTCacheStats returns the number of entries currently in memory cache.
