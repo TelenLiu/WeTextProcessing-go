@@ -136,10 +136,11 @@ func (c *Cardinal) BuildTagger() {
 		digit_t.Concat(lib.Insert(" ").Concat(digit_t).Star()), 0.1,
 	)
 
-	// Tagger: positive: "value: ...", negative: "negative: true value: ..."
-	posTag := lib.Insert("value: \"").Concat(all).Concat(lib.Insert("\""))
+	// Tagger: positive: "integer: ...", negative: "negative: true integer: ..."
+	// Matching Python's field name "integer:" (not "value:")
+	posTag := lib.Insert("integer: \"").Concat(all).Concat(lib.Insert("\""))
 	negTag := pynini.Cross("-", "negative: \"true\" ").Concat(
-		lib.Insert("value: \"").Concat(all).Concat(lib.Insert("\"")),
+		lib.Insert("integer: \"").Concat(all).Concat(lib.Insert("\"")),
 	)
 	tagger := pynini.Union(posTag, negTag)
 	c.Tagger = c.AddTokens(tagger)
@@ -154,12 +155,16 @@ func (c *Cardinal) BuildTagger() {
 }
 
 func (c *Cardinal) BuildVerbalizer() {
-	optionalSign := pynini.Cross("negative: \"true\"", "minus ")
+	// Matching Python: optional_sign maps "negative: true" to "negative" or "minus"
+	// Python test data expects "negative" as the default output
+	negativeSign := pynini.Cross("negative: \"true\"", "negative ")
+	minusSign := lib.AddWeight(pynini.Cross("negative: \"true\"", "minus "), 0.0001)
+	optionalSign := negativeSign.Union(minusSign)
 	optionalSign = (optionalSign.Concat(c.DELETE_SPACE)).Ques()
 	integer := c.DELETE_SPACE.Concat(
 		lib.DeleteString("\"").Concat(c.NOT_QUOTE.Star()).Concat(lib.DeleteString("\"")),
 	)
-	integer = lib.DeleteString("value:").Concat(integer)
+	integer = lib.DeleteString("integer:").Concat(integer)
 	c.Verbalizer = c.DeleteTokens(optionalSign.Concat(integer)).Optimize()
 }
 

@@ -1,5 +1,10 @@
 package pynini
 
+import (
+	"bytes"
+	"encoding/gob"
+)
+
 // SymbolTable provides a bidirectional mapping between string labels and int32 IDs.
 // Label 0 is always reserved for epsilon (empty string).
 // This is the key optimization: arcs store int32 labels instead of strings,
@@ -7,6 +12,52 @@ package pynini
 type SymbolTable struct {
 	symToID map[string]int32
 	idToSym []string
+}
+
+// GobEncode implements gob.GobEncoder for SymbolTable.
+// Required because symToID and idToSym are unexported fields
+// which gob cannot encode by default.
+func (st *SymbolTable) GobEncode() ([]byte, error) {
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+	if err := enc.Encode(st.idToSym); err != nil {
+		return nil, err
+	}
+	// Encode symToID as a slice of key-value pairs for deterministic encoding
+	type kv struct {
+		K string
+		V int32
+	}
+	pairs := make([]kv, 0, len(st.symToID))
+	for k, v := range st.symToID {
+		pairs = append(pairs, kv{K: k, V: v})
+	}
+	if err := enc.Encode(pairs); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// GobDecode implements gob.GobDecoder for SymbolTable.
+func (st *SymbolTable) GobDecode(data []byte) error {
+	buf := bytes.NewBuffer(data)
+	dec := gob.NewDecoder(buf)
+	if err := dec.Decode(&st.idToSym); err != nil {
+		return err
+	}
+	type kv struct {
+		K string
+		V int32
+	}
+	var pairs []kv
+	if err := dec.Decode(&pairs); err != nil {
+		return err
+	}
+	st.symToID = make(map[string]int32, len(pairs))
+	for _, p := range pairs {
+		st.symToID[p.K] = p.V
+	}
+	return nil
 }
 
 // NewSymbolTable creates a new symbol table with epsilon (label 0) pre-registered.

@@ -41,6 +41,8 @@ type Processor struct {
 	cachePrefix         string
 	taggerBuilder       func() *pynini.Fst
 	verbalizerBuilder   func() *pynini.Fst
+	taggerRef           *pynini.Fst // cached tagger FST reference for fast access
+	verbalizerRef       *pynini.Fst // cached verbalizer FST reference for fast access
 
 	// Build configuration
 	buildConcurrency int
@@ -48,6 +50,9 @@ type Processor struct {
 
 	// Lazy base FST initialization
 	baseFstLoaded bool
+
+	// Cached TokenParser (reused across Verbalize calls)
+	tokenParser *TokenParser
 }
 
 func (p *Processor) GetBuildConfig() (concurrency int, progress BuildProgressFn) {
@@ -110,6 +115,7 @@ func NewProcessor(name string, ordertype ...string) *Processor {
 	p.DELETE_ZERO_OR_ONE_SPACE = lib.Delete(p.SPACE).Ques()
 
 	p.baseFstLoaded = true
+	p.tokenParser = NewTokenParser(ot)
 	return p
 }
 
@@ -246,7 +252,10 @@ func (p *Processor) saveBaseFst(cacheDir, prefix string) {
 	}
 	save := func(name string, fst *pynini.Fst) {
 		if fst != nil {
-			pynini.FstWrite(fst, basePath(name))
+			if err := pynini.FstWrite(fst, basePath(name)); err != nil {
+				// Remove partial/corrupt file so tryLoadBaseFst won't load it
+				os.Remove(basePath(name))
+			}
 		}
 	}
 	save("vsig", p.VSIGMA)
@@ -267,23 +276,28 @@ func (p *Processor) BuildFst(prefix, cacheDir string, overwriteCache bool) {
 }
 
 // loadTagger returns the tagger FST, loading via cache if needed.
-// When cache is used, p.Tagger is cleared to allow the old FST to be GC'd.
+// The result is cached in p.taggerRef for fast subsequent access.
 func (p *Processor) loadTagger() *pynini.Fst {
+	if p.taggerRef != nil {
+		return p.taggerRef
+	}
 	if p.cache != nil && p.cachePrefix != "" {
 		fst := p.cache.GetOrBuild(p.cachePrefix+"_tagger", p.taggerBuilder)
-		// Clear p.Tagger so old evicted FSTs can be GC'd.
-		// loadTagger is the sole source of truth when cache is active.
-		p.Tagger = nil
+		p.taggerRef = fst
 		return fst
 	}
 	return p.Tagger
 }
 
 // loadVerbalizer returns the verbalizer FST, loading via cache if needed.
+// The result is cached in p.verbalizerRef for fast subsequent access.
 func (p *Processor) loadVerbalizer() *pynini.Fst {
+	if p.verbalizerRef != nil {
+		return p.verbalizerRef
+	}
 	if p.cache != nil && p.cachePrefix != "" {
 		fst := p.cache.GetOrBuild(p.cachePrefix+"_verbalizer", p.verbalizerBuilder)
-		p.Verbalizer = nil
+		p.verbalizerRef = fst
 		return fst
 	}
 	return p.Verbalizer
@@ -298,7 +312,7 @@ func (p *Processor) Tag(input string) string {
 		return ""
 	}
 	input = pynini.Escape(input)
-	return pynini.Accep(input).ComposeShortestPath(tagger)
+	return pynini.ComposeInputWithFst(input, nil, tagger)
 }
 
 func (p *Processor) Verbalize(input string) string {
@@ -309,8 +323,8 @@ func (p *Processor) Verbalize(input string) string {
 	if verbalizer == nil || len(verbalizer.States) == 0 {
 		return ""
 	}
-	output := NewTokenParser(p.Ordertype).Reorder(input)
-	return pynini.Accep(output).ComposeShortestPath(verbalizer)
+	output := p.tokenParser.Reorder(input)
+	return pynini.ComposeInputWithFst(pynini.Escape(output), nil, verbalizer)
 }
 
 func (p *Processor) Normalize(input string) string {

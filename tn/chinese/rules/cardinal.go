@@ -90,7 +90,7 @@ func (c *Cardinal) BuildTagger() {
 			),
 		)
 
-	number := pynini.Union(digits, ten, hundred, hundred2, thousand, thousand2, ten_thousand, ten_thousand2)
+	number := pynini.Union(digits, ten, hundred, lib.AddWeight(hundred2, -0.0001), thousand, lib.AddWeight(thousand2, -0.0001), ten_thousand, lib.AddWeight(ten_thousand2, -0.0001))
 	number = sign.Ques().Concat(number).Concat(dot.Concat(digits.Plus()).Ques())
 	percent := lib.Insert("百分之").Concat(number).Concat(lib.DeleteString("%"))
 	c.Number = pynini.Accep("约").Ques().Concat(pynini.Accep("人均").Ques()).Concat(pynini.Union(number, percent))

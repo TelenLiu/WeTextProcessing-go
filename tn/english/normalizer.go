@@ -20,6 +20,7 @@ type ruleEntry struct {
 	tagger     *pynini.Fst
 	verbalizer *pynini.Fst
 	weight     float32
+	startLabels map[int32]bool // ilabels from the tagger start state (for fast skip)
 }
 
 // Normalizer performs English text normalization using greedy runtime matching
@@ -46,6 +47,9 @@ type Normalizer struct {
 	// Ordered list of rules for greedy matching (higher priority first)
 	rules []ruleEntry
 
+	// Cached token parser for verbalizer (avoids per-call allocation)
+	tokenParser *tn.TokenParser
+
 	// Build timing
 	buildTime time.Duration
 }
@@ -58,7 +62,8 @@ func NewNormalizer(
 	// English TN doesn't need CJK characters; reset to avoid performance overhead
 	lib.ResetCJKVCHAR()
 	n := &Normalizer{
-		Processor: tn.NewProcessor("en_normalizer", "en_tn"),
+		Processor:    tn.NewProcessor("en_normalizer", "en_tn"),
+		tokenParser:  tn.NewTokenParser("en_tn"),
 	}
 	var pf tn.BuildProgressFn
 	if len(progress) > 0 {
@@ -89,16 +94,16 @@ func (n *Normalizer) buildTaggerInternal() {
 		{"punct", func() { n.punctRule = rules.NewPunctuation() }},
 		{"ordinal", func() { n.ordinalRule = rules.NewOrdinal() }},
 		{"decimal", func() { n.decimalRule = rules.NewDecimal() }},
-		// These rules are built lazily on first use to reduce initial build time and memory
-		// {"fraction", func() { n.fractionRule = rules.NewFraction() }},
-		// {"date", func() { n.dateRule = rules.NewDate() }},
-		// {"time", func() { n.timeRule = rules.NewTime() }},
+		{"fraction", func() { n.fractionRule = rules.NewFraction() }},
+		{"date", func() { n.dateRule = rules.NewDate() }},
+		{"time", func() { n.timeRule = rules.NewTime() }},
+		{"money", func() { n.moneyRule = rules.NewMoney() }},
+		{"telephone", func() { n.telephoneRule = rules.NewTelephone() }},
+		{"whitelist", func() { n.whitelistRule = rules.NewWhitelist() }},
+		{"range", func() { n.rangeRule = rules.NewRange() }},
+		// measure and electronic cause OOM due to VCHAR.Star().Compose() state explosion
 		// {"measure", func() { n.measureRule = rules.NewMeasure() }},
-		// {"money", func() { n.moneyRule = rules.NewMoney() }},
-		// {"telephone", func() { n.telephoneRule = rules.NewTelephone() }},
 		// {"electronic", func() { n.electronicRule = rules.NewElectronic() }},
-		// {"whitelist", func() { n.whitelistRule = rules.NewWhitelist() }},
-		// {"range", func() { n.rangeRule = rules.NewRange() }},
 	}
 	for i, t := range tasks {
 		wg.Add(1)
@@ -114,15 +119,60 @@ func (n *Normalizer) buildTaggerInternal() {
 	}
 	wg.Wait()
 
+	// Sort arcs for efficient binary search in composition
+	sortArcs := func(f *pynini.Fst) {
+		if f != nil && len(f.States) > 0 {
+			f.ArcSort("input")
+			f.PrepareForComposition()
+		}
+	}
+	sortArcs(n.cardinalRule.Tagger)
+	sortArcs(n.cardinalRule.Verbalizer)
+	sortArcs(n.ordinalRule.Tagger)
+	sortArcs(n.ordinalRule.Verbalizer)
+	sortArcs(n.decimalRule.Tagger)
+	sortArcs(n.decimalRule.Verbalizer)
+	sortArcs(n.fractionRule.Tagger)
+	sortArcs(n.fractionRule.Verbalizer)
+	sortArcs(n.dateRule.Tagger)
+	sortArcs(n.dateRule.Verbalizer)
+	sortArcs(n.timeRule.Tagger)
+	sortArcs(n.timeRule.Verbalizer)
+	sortArcs(n.moneyRule.Tagger)
+	sortArcs(n.moneyRule.Verbalizer)
+	sortArcs(n.telephoneRule.Tagger)
+	sortArcs(n.telephoneRule.Verbalizer)
+	sortArcs(n.whitelistRule.Tagger)
+	sortArcs(n.whitelistRule.Verbalizer)
+	sortArcs(n.rangeRule.Tagger)
+	sortArcs(n.rangeRule.Verbalizer)
+	sortArcs(n.wordRule.Tagger)
+	sortArcs(n.wordRule.Verbalizer)
+	sortArcs(n.punctRule.Tagger)
+	sortArcs(n.punctRule.Verbalizer)
+
 	// Build ordered rule list for greedy matching.
-	// Lower weight = higher priority. Word rule has very high weight (fallback).
-	// Punctuation has higher weight than numbers to prefer number matches.
+	// Lower weight = higher priority. Matching Python's add_weight ordering.
 	n.rules = []ruleEntry{
-		{"cardinal", n.cardinalRule.Tagger, n.cardinalRule.Verbalizer, 1.0},
-		{"ordinal", n.ordinalRule.Tagger, n.ordinalRule.Verbalizer, 1.0},
-		{"decimal", n.decimalRule.Tagger, n.decimalRule.Verbalizer, 1.0},
-		{"punct", n.punctRule.Tagger, n.punctRule.Verbalizer, 2.0},
-		{"word", n.wordRule.Tagger, n.wordRule.Verbalizer, 100.0},
+		{"date", n.dateRule.Tagger, n.dateRule.Verbalizer, 0.99, nil},
+		{"cardinal", n.cardinalRule.Tagger, n.cardinalRule.Verbalizer, 1.0, nil},
+		{"ordinal", n.ordinalRule.Tagger, n.ordinalRule.Verbalizer, 1.0, nil},
+		{"decimal", n.decimalRule.Tagger, n.decimalRule.Verbalizer, 1.0, nil},
+		{"fraction", n.fractionRule.Tagger, n.fractionRule.Verbalizer, 1.0, nil},
+		{"time", n.timeRule.Tagger, n.timeRule.Verbalizer, 1.0, nil},
+		{"money", n.moneyRule.Tagger, n.moneyRule.Verbalizer, 1.0, nil},
+		{"telephone", n.telephoneRule.Tagger, n.telephoneRule.Verbalizer, 1.0, nil},
+		{"whitelist", n.whitelistRule.Tagger, n.whitelistRule.Verbalizer, 1.0, nil},
+		{"range", n.rangeRule.Tagger, n.rangeRule.Verbalizer, 1.01, nil},
+		{"p", n.punctRule.Tagger, n.punctRule.Verbalizer, 2.0, nil},
+		{"w", n.wordRule.Tagger, n.wordRule.Verbalizer, 100.0, nil},
+	}
+
+	// Pre-compute start labels for each rule's tagger FST.
+	// These are the ilabels reachable from the start state (including epsilon closure),
+	// used to quickly skip rules that cannot match at a given position.
+	for i := range n.rules {
+		n.rules[i].startLabels = computeStartLabels(n.rules[i].tagger)
 	}
 	sort.SliceStable(n.rules, func(i, j int) bool {
 		return n.rules[i].weight < n.rules[j].weight
@@ -209,10 +259,48 @@ func (n *Normalizer) Normalize(input string) string {
 	return output
 }
 
+// computeStartLabels returns the set of ilabels reachable from the start state
+// of the given FST, including ilabels reachable via epsilon transitions.
+// This is used for a fast "can this rule possibly match?" check.
+func computeStartLabels(fst *pynini.Fst) map[int32]bool {
+	if fst == nil || len(fst.States) == 0 {
+		return nil
+	}
+	labels := make(map[int32]bool)
+	visited := make(map[int32]bool)
+	var queue []int32
+	queue = append(queue, fst.Start)
+	visited[fst.Start] = true
+
+	for len(queue) > 0 {
+		sid := queue[0]
+		queue = queue[1:]
+		state := &fst.States[sid]
+		for i := range state.Arcs {
+			arc := &state.Arcs[i]
+			if arc.ILabel != pynini.EpsilonLabel {
+				labels[arc.ILabel] = true
+			} else if !visited[arc.Next] {
+				visited[arc.Next] = true
+				queue = append(queue, arc.Next)
+			}
+		}
+	}
+	return labels
+}
+
 // findBestMatch tries all rules at the given position and returns the best match.
-// Uses ComposePrefixShortestPath for efficient prefix matching.
+// Optimized with:
+//   - startLabels fast-path to skip rules that can't match at this position
+//   - Limited search depth (maxLen) to avoid processing very long strings
 func (n *Normalizer) findBestMatch(runes []rune, pos int) *matchResult {
-	remaining := string(runes[pos:])
+	// Limit search depth: most English TN matches are < 40 characters
+	const maxLen = 50
+	end := len(runes)
+	if end-pos > maxLen {
+		end = pos + maxLen
+	}
+	remaining := string(runes[pos:end])
 	escaped := pynini.Escape(remaining)
 
 	var best *matchResult
@@ -220,6 +308,15 @@ func (n *Normalizer) findBestMatch(runes []rune, pos int) *matchResult {
 	for _, r := range n.rules {
 		if r.tagger == nil || len(r.tagger.States) == 0 {
 			continue
+		}
+
+		// Fast-path: skip rules whose start state can't match the first character.
+		// Compute the first character's label using this rule's own symbol table.
+		if len(r.startLabels) > 0 {
+			firstLabel := r.tagger.FindRuneLabel(runes[pos])
+			if firstLabel >= 0 && !r.startLabels[firstLabel] {
+				continue
+			}
 		}
 
 		result := pynini.ComposePrefixShortestPath(escaped, r.tagger)
@@ -255,12 +352,8 @@ func (n *Normalizer) applyVerbalizer(tagOutput string, verbalizer *pynini.Fst) s
 	if verbalizer == nil || len(verbalizer.States) == 0 {
 		return ""
 	}
-	// Reorder tokens for the verbalizer
-	reordered := tn.NewTokenParser("en_tn").Reorder(tagOutput)
-	// Do NOT escape the tag output - it contains " characters that are part of
-	// the tag format and must be matched literally by the verbalizer.
-	input := pynini.Accep(reordered)
-	return input.ComposeShortestPath(verbalizer)
+	reordered := n.tokenParser.Reorder(tagOutput)
+	return pynini.ComposeInputWithFst(pynini.Escape(reordered), nil, verbalizer)
 }
 
 // isPunctuation checks if a string is a single punctuation character.

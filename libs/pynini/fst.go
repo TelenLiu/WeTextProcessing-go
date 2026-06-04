@@ -1,9 +1,11 @@
 package pynini
 
 import (
+	"container/heap"
 	"encoding/gob"
 	"os"
 	"strings"
+	"sync"
 )
 
 // =============================================================================
@@ -63,6 +65,14 @@ type State struct {
 	NumOEps int32
 }
 
+// ilabelRangeMap stores precomputed ilabel-to-arc-index mapping for a state.
+// For sorted arcs, this allows O(log n) lookup of arcs by ilabel.
+type ilabelRangeMap struct {
+	labels []int32 // sorted distinct ilabels
+	starts []int   // start index in Arcs for each label
+	counts []int   // number of arcs for each label
+}
+
 // Fst represents a finite-state transducer.
 // States are stored in a dense slice (index = state ID) for O(1) access
 // and contiguous memory layout. Labels are int32 IDs from the SymbolTable.
@@ -71,6 +81,14 @@ type Fst struct {
 	Start   int32
 	Symbols *SymbolTable
 	Props   uint64
+
+	// Compose cache (lazily initialized, not serialized by gob)
+	epsArcIdx    [][]int          // epsArcIdx[s] = indices of epsilon arcs from state s (nil if none)
+	ilabelRanges []ilabelRangeMap // ilabelRanges[s] = precomputed ilabel mapping
+	composeReady bool
+
+	// Rune label cache (lazily initialized, not serialized by gob)
+	runeLabelCache map[rune]int32
 }
 
 // =============================================================================
@@ -92,6 +110,31 @@ func (s *State) AddArc(arc Arc) {
 		s.NumOEps++
 	}
 	s.Arcs = append(s.Arcs, arc)
+}
+
+// FindRuneLabel returns the symbol table ID for a rune, using a cache to avoid
+// repeated string(r) allocations and map lookups. Returns -1 if not found.
+func (f *Fst) FindRuneLabel(r rune) int32 {
+	if f.runeLabelCache == nil {
+		f.runeLabelCache = make(map[rune]int32, 256)
+	}
+	if id, ok := f.runeLabelCache[r]; ok {
+		return id
+	}
+	id := f.Symbols.Find(string(r))
+	f.runeLabelCache[r] = id
+	return id
+}
+
+// ComputeInputLabels computes the symbol table label IDs for each rune in the
+// input string. Uses the FST's rune label cache for efficiency.
+func (f *Fst) ComputeInputLabels(input string) []int32 {
+	runes := []rune(input)
+	labels := make([]int32, len(runes))
+	for i, r := range runes {
+		labels[i] = f.FindRuneLabel(r)
+	}
+	return labels
 }
 
 // =============================================================================
@@ -379,8 +422,13 @@ func Union(fs ...*Fst) *Fst {
 	return result
 }
 
+// maxComposeStates limits the number of states in a composed FST to prevent OOM.
+// When the limit is exceeded, composition stops early and returns what was built.
+const maxComposeStates = 500000
+
 // Compose composes this FST with another FST.
 // Uses int label matching for O(1) comparison instead of string matching.
+// Includes a state limit (maxComposeStates) to prevent OOM from state explosion.
 func (f *Fst) Compose(other *Fst) *Fst {
 	if f == nil || other == nil {
 		return NewFst()
@@ -432,6 +480,9 @@ func (f *Fst) Compose(other *Fst) *Fst {
 					np := pair{s1: a1.Next, s2: a2.Next}
 					npID, seen := visited[np]
 					if !seen {
+						if nextID >= int32(maxComposeStates) {
+							continue // skip new state, limit reached
+						}
 						npID = nextID
 						nextID++
 						visited[np] = npID
@@ -447,6 +498,9 @@ func (f *Fst) Compose(other *Fst) *Fst {
 				np := pair{s1: a1.Next, s2: p.s2}
 				npID, seen := visited[np]
 				if !seen {
+					if nextID >= int32(maxComposeStates) {
+						continue
+					}
 					npID = nextID
 					nextID++
 					visited[np] = npID
@@ -463,6 +517,9 @@ func (f *Fst) Compose(other *Fst) *Fst {
 				np := pair{s1: p.s1, s2: a2.Next}
 				npID, seen := visited[np]
 				if !seen {
+					if nextID >= int32(maxComposeStates) {
+						continue
+					}
 					npID = nextID
 					nextID++
 					visited[np] = npID
@@ -739,6 +796,15 @@ func (f *Fst) Difference(other *Fst) *Fst {
 		return charUnionDifference(f, other)
 	}
 
+	// Try to extract single-character strings from other and use
+	// char-union-aware difference. This handles cases like
+	// VCHAR.Difference(Union(Accep("\\"), Accep("\""))) where other
+	// is a union of single-character acceptors.
+	excludeChars := collectSingleCharStrings(other)
+	if len(excludeChars) > 0 {
+		return charUnionDifferenceByChars(f, excludeChars)
+	}
+
 	return f.copy()
 }
 
@@ -797,6 +863,148 @@ func charUnionDifference(f, other *Fst) *Fst {
 	return result
 }
 
+// collectSingleCharStrings collects all single-character strings accepted by an FST.
+// It performs a BFS from the start state, following epsilon and non-epsilon arcs,
+// and records any single-character strings that lead to a final state.
+func collectSingleCharStrings(f *Fst) map[string]bool {
+	result := make(map[string]bool)
+	if f == nil || len(f.States) == 0 {
+		return result
+	}
+
+	// BFS to find all paths of length 1 (single character) from start to final
+	type stateWithChar struct {
+		state int32
+		char  string // empty means we haven't consumed a character yet
+	}
+
+	visited := make(map[stateWithChar]bool)
+	queue := []stateWithChar{{state: f.Start, char: ""}}
+
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+
+		if visited[cur] {
+			continue
+		}
+		visited[cur] = true
+
+		st := &f.States[cur.state]
+		for _, arc := range st.Arcs {
+			isym := f.Symbols.Symbol(arc.ILabel)
+			if isym == "" { // epsilon arc
+				next := stateWithChar{state: arc.Next, char: cur.char}
+				if !visited[next] {
+					queue = append(queue, next)
+				}
+			} else if cur.char == "" && len([]rune(isym)) == 1 {
+				// First non-epsilon character on this path
+				next := stateWithChar{state: arc.Next, char: isym}
+				if !visited[next] {
+					queue = append(queue, next)
+				}
+			}
+			// Skip paths with more than one character
+		}
+	}
+
+	// Now check which single-char paths reach a final state (via epsilon arcs)
+	for swc := range visited {
+		if swc.char == "" {
+			continue
+		}
+		// Check if we can reach a final state from swc.state via epsilon arcs only
+		if canReachFinalViaEpsilon(f, swc.state) {
+			result[swc.char] = true
+		}
+	}
+
+	return result
+}
+
+// canReachFinalViaEpsilon checks if a final state is reachable from the given
+// state following only epsilon arcs.
+func canReachFinalViaEpsilon(f *Fst, start int32) bool {
+	if f.States[start].Final {
+		return true
+	}
+	visited := make(map[int32]bool)
+	queue := []int32{start}
+	for len(queue) > 0 {
+		s := queue[0]
+		queue = queue[1:]
+		if visited[s] {
+			continue
+		}
+		visited[s] = true
+		if f.States[s].Final {
+			return true
+		}
+		for _, arc := range f.States[s].Arcs {
+			if arc.ILabel == EpsilonLabel && !visited[arc.Next] {
+				queue = append(queue, arc.Next)
+			}
+		}
+	}
+	return false
+}
+
+// charUnionDifferenceByChars removes characters in the exclude set from a
+// char-union-like FST. It follows epsilon arcs from the start state to find
+// all character arcs, and filters out those matching the exclude set.
+// This handles both simple char-unions and Union-of-char-unions (like CJK VCHAR).
+func charUnionDifferenceByChars(f *Fst, exclude map[string]bool) *Fst {
+	result := f.copy()
+
+	// Find all states reachable from start via epsilon arcs
+	epsilonReachable := []int32{f.Start}
+	visited := make(map[int32]bool)
+	{
+		queue := []int32{f.Start}
+		for len(queue) > 0 {
+			s := queue[0]
+			queue = queue[1:]
+			if visited[s] {
+				continue
+			}
+			visited[s] = true
+			for _, arc := range result.States[s].Arcs {
+				if arc.ILabel == EpsilonLabel && !visited[arc.Next] {
+					queue = append(queue, arc.Next)
+					epsilonReachable = append(epsilonReachable, arc.Next)
+				}
+			}
+		}
+	}
+
+	// Filter character arcs from all epsilon-reachable states
+	for _, stateID := range epsilonReachable {
+		st := &result.States[stateID]
+		newArcs := make([]Arc, 0, len(st.Arcs))
+		removedIEps := int32(0)
+		removedOEps := int32(0)
+		for _, arc := range st.Arcs {
+			sym := result.Symbols.Symbol(arc.ILabel)
+			if arc.ILabel == EpsilonLabel || !exclude[sym] {
+				newArcs = append(newArcs, arc)
+			} else {
+				if arc.ILabel == EpsilonLabel {
+					removedIEps++
+				}
+				if arc.OLabel == EpsilonLabel {
+					removedOEps++
+				}
+			}
+		}
+		st.Arcs = newArcs
+		st.NumIEps -= removedIEps
+		st.NumOEps -= removedOEps
+	}
+
+	return result
+}
+
 // =============================================================================
 // Cdrewrite
 // =============================================================================
@@ -805,30 +1013,215 @@ func charUnionDifference(f, other *Fst) *Fst {
 // sigma should already be a starred alphabet (e.g. VSIGMA = VCHAR.Star()).
 //
 // Builds: sigma* concat L concat phi concat R concat sigma*
-// in a single pass to avoid the explosion from chaining Concat which
-// copies the large sigma* FST 5+ times.
 //
 // The sigma* copies have a small weight penalty on character-consuming arcs
 // to ensure the rule (phi) is preferred over consuming input via sigma*.
 // This matches the C++ Cdrewrite semantics where the rule application path
 // should win when it can match.
+//
+// Optimization: when sigma has the "star pattern" (a hub state with character
+// arcs looping back through it), we build the cdrewrite directly without
+// copying the entire sigma FST. Instead, we extract the character arcs from
+// sigma's hub and add them as self-loops to the start and end states.
+// This reduces state count from ~2*sigma_states+core to ~2+core.
 func Cdrewrite(fst *Fst, l, r string, sigma *Fst) *Fst {
 	if fst == nil || sigma == nil {
 		return NewFst()
 	}
 
 	// Build the core: Accep(l) concat fst concat Accep(r)
-	// These are small FSTs so chaining Concat is cheap.
 	left := Accep(l)
 	right := Accep(r)
 	core := left.Concat(fst).Concat(right)
 
-	// Build result: sigma concat core concat sigma — in one pass.
-	// We use a small weight penalty on sigma's character arcs so that
-	// the rule application path (epsilon-to-core) has lower total weight
-	// than the path where sigma* consumes characters and the rule
-	// falls through to a default (e.g., Insert("th")).
-	const sigmaArcPenalty = 0.0001
+	// Try optimized path: extract character arcs from sigma's star pattern
+	charArcs := extractStarCharArcs(sigma)
+	if charArcs != nil {
+		return cdrewriteFromCharArcs(core, charArcs, sigma.Symbols)
+	}
+
+	// General path: fall back to copying sigma
+	return cdrewriteGeneral(core, sigma)
+}
+
+// extractStarCharArcs extracts character arcs from a sigma* FST that has the
+// "star pattern": a hub state reachable from start via epsilon, with character
+// arcs reachable via an epsilon tree from the hub, and all character arc targets
+// are final with epsilon arcs back to the hub.
+//
+// The star pattern (from VCHAR.Star()) can have two forms:
+//
+// Simple (small character sets):
+//
+//	State 0 (start, final): epsilon to state 1 (hub)
+//	State 1 (hub): character arcs to states 2..N+1
+//	States 2..N+1: final, epsilon back to state 1
+//
+// Tree (large character sets from binary Union):
+//
+//	State 0 (start, final): epsilon to state 1 (hub)
+//	State 1 (hub): epsilon to state 2, epsilon to state 7
+//	State 2: epsilon to state 3, epsilon to state 5
+//	State 3: "a" -> state 4
+//	State 4 (final): epsilon back to state 1
+//	State 5: "b" -> state 6
+//	State 6 (final): epsilon back to state 1
+//	State 7: "c" -> state 8
+//	State 8 (final): epsilon back to state 1
+//
+// For cdrewrite, we only need the character arcs (as self-loops), not the
+// full state structure. This avoids copying 8000+ states twice.
+func extractStarCharArcs(sigma *Fst) []Arc {
+	if sigma == nil || len(sigma.States) < 2 {
+		return nil
+	}
+
+	startState := &sigma.States[sigma.Start]
+	if !startState.Final {
+		return nil
+	}
+
+	// Find the hub state: the state reachable via epsilon from start
+	var hub int32 = -1
+	epsilonCount := 0
+	for _, arc := range startState.Arcs {
+		if arc.ILabel == EpsilonLabel && arc.OLabel == EpsilonLabel {
+			hub = arc.Next
+			epsilonCount++
+		}
+	}
+	// Hub must be reachable via exactly one pure-epsilon arc from start
+	if hub < 0 || epsilonCount != 1 || int(hub) >= len(sigma.States) {
+		return nil
+	}
+
+	// Walk the epsilon tree from the hub, collecting all character arcs.
+	// The tree structure comes from binary Union: each Union creates a new
+	// state with two epsilon arcs to the two operands.
+	var charArcs []Arc
+	visited := make(map[int32]bool)
+	queue := []int32{hub}
+	for len(queue) > 0 {
+		s := queue[0]
+		queue = queue[1:]
+		if visited[s] || int(s) >= len(sigma.States) {
+			continue
+		}
+		visited[s] = true
+		st := &sigma.States[s]
+		for _, arc := range st.Arcs {
+			if arc.ILabel == EpsilonLabel && arc.OLabel == EpsilonLabel {
+				// Follow epsilon arcs within the tree
+				queue = append(queue, arc.Next)
+			} else if arc.ILabel != EpsilonLabel {
+				// Collect character arcs
+				charArcs = append(charArcs, Arc{
+					ILabel: arc.ILabel,
+					OLabel: arc.OLabel,
+					Weight: arc.Weight,
+				})
+			}
+		}
+	}
+
+	if len(charArcs) == 0 {
+		return nil
+	}
+
+	// Verify the star pattern: each character arc target should be final
+	// and have an epsilon arc back to the hub
+	for _, arc := range charArcs {
+		if int(arc.Next) >= len(sigma.States) {
+			return nil
+		}
+		target := &sigma.States[arc.Next]
+		if !target.Final {
+			return nil
+		}
+		// Check that target has an epsilon arc back to hub
+		foundBack := false
+		for _, backArc := range target.Arcs {
+			if backArc.ILabel == EpsilonLabel && backArc.OLabel == EpsilonLabel && backArc.Next == hub {
+				foundBack = true
+				break
+			}
+		}
+		if !foundBack {
+			return nil
+		}
+	}
+
+	return charArcs
+}
+
+// cdrewriteFromCharArcs builds a cdrewrite FST efficiently using extracted
+// character arcs from sigma*. Instead of copying the entire sigma FST twice,
+// it adds character self-loops to the start and end states.
+//
+// Result structure:
+//
+//	State 0 (start, final): char self-loops (weight+penalty) + epsilon to core
+//	Core states: as-is from core
+//	State N (final): char self-loops (weight+penalty)
+//	Core's final states: epsilon to state N
+func cdrewriteFromCharArcs(core *Fst, charArcs []Arc, sigmaSymbols *SymbolTable) *Fst {
+	const sigmaArcPenalty = float32(0.0001)
+
+	result := NewFst()
+	// Merge sigma's symbols first so char arc labels are valid
+	result.Symbols.Merge(sigmaSymbols)
+	// Merge core's symbols
+	coreMapping := result.Symbols.Merge(core.Symbols)
+
+	// State 0: start state with character self-loops
+	// (also final, matching sigma*'s "match zero characters" behavior)
+	result.States[0].Final = true
+
+	for _, arc := range charArcs {
+		result.AddArc(0, 0, arc.ILabel, arc.OLabel, arc.Weight+sigmaArcPenalty)
+	}
+
+	// Add core states starting from state 1
+	coreOffset := int32(1)
+	for i := range core.States {
+		newFrom := int32(i) + coreOffset
+		ensureState(result, newFrom)
+		for _, arc := range core.States[i].Arcs {
+			result.AddArc(newFrom, arc.Next+coreOffset,
+				coreMapping[arc.ILabel], coreMapping[arc.OLabel], arc.Weight)
+		}
+		if core.States[i].Final {
+			result.SetFinal(newFrom, core.States[i].Weight)
+		}
+	}
+
+	// Connect start state to core's start
+	result.AddArc(0, core.Start+coreOffset, EpsilonLabel, EpsilonLabel, 0)
+
+	// Add trailing sigma* state (character self-loops + final)
+	trailingState := int32(result.NumStates())
+	result.AddState()
+	result.SetFinal(trailingState, 0)
+	for _, arc := range charArcs {
+		result.AddArc(trailingState, trailingState, arc.ILabel, arc.OLabel, arc.Weight+sigmaArcPenalty)
+	}
+
+	// Connect core's final states to trailing sigma* state
+	for sID := coreOffset; sID < trailingState; sID++ {
+		if result.States[sID].Final {
+			result.States[sID].Final = false
+			result.States[sID].Weight = 0
+			result.AddArc(sID, trailingState, EpsilonLabel, EpsilonLabel, 0)
+		}
+	}
+
+	return result
+}
+
+// cdrewriteGeneral builds a cdrewrite FST by copying sigma twice.
+// This is the fallback for sigma FSTs that don't match the star pattern.
+func cdrewriteGeneral(core *Fst, sigma *Fst) *Fst {
+	const sigmaArcPenalty = float32(0.0001)
 
 	// Step 1: copy sigma with weighted character arcs
 	sigma1 := sigma.copy()
@@ -917,7 +1310,7 @@ func Escape(input string) string {
 	var sb strings.Builder
 	for _, ch := range input {
 		switch ch {
-		case '\\', '"', '[', ']':
+		case '\\', '[', ']':
 			sb.WriteRune('\\')
 			sb.WriteRune(ch)
 		default:
@@ -941,7 +1334,7 @@ func FstRead(path string) (*Fst, error) {
 	decoder := gob.NewDecoder(file)
 	var f Fst
 	if err := decoder.Decode(&f); err != nil {
-		return NewFst(), nil
+		return nil, err
 	}
 	return &f, nil
 }
@@ -1008,33 +1401,40 @@ func maxStateID(f *Fst) int32 {
 
 // ShortestPath uses Dijkstra's algorithm to find the path with minimum
 // total weight from start to a final state, returning concatenated output labels.
+// Uses a heap-based priority queue for O((V+E) log V) complexity and
+// backpointers to reconstruct the output path.
 func (f *Fst) ShortestPath() string {
-	if f == nil {
+	if f == nil || len(f.States) == 0 {
 		return ""
 	}
 
-	type node struct {
-		state  int32
-		output string
-		weight float32
+	// backptr stores the arc used to reach a state and the predecessor state.
+	type backptr struct {
+		olabel int32
+		from   int32
 	}
 
-	pq := []node{{state: f.Start, output: "", weight: 0}}
-	best := map[int32]float32{f.Start: 0}
+	dist := make([]float32, len(f.States))
+	for i := range dist {
+		dist[i] = float32(1e30)
+	}
+	dist[f.Start] = 0
 
-	for len(pq) > 0 {
-		minIdx := 0
-		for i := 1; i < len(pq); i++ {
-			if pq[i].weight < pq[minIdx].weight {
-				minIdx = i
-			}
-		}
-		cur := pq[minIdx]
-		pq = append(pq[:minIdx], pq[minIdx+1:]...)
+	prev := make([]backptr, len(f.States))
+	for i := range prev {
+		prev[i] = backptr{olabel: -1, from: -1}
+	}
 
-		if cur.weight > best[cur.state] {
+	// Min-heap entries: (weight, state)
+	h := &shortestPathHeap{{weight: 0, state: f.Start}}
+	visited := make([]bool, len(f.States))
+
+	for h.Len() > 0 {
+		cur := heap.Pop(h).(shortestPathEntry)
+		if visited[cur.state] {
 			continue
 		}
+		visited[cur.state] = true
 
 		if int(cur.state) >= len(f.States) {
 			continue
@@ -1042,15 +1442,32 @@ func (f *Fst) ShortestPath() string {
 		st := &f.States[cur.state]
 
 		if st.Final {
-			return cur.output
+			// Reconstruct output path via backpointers
+			var labels []int32
+			s := cur.state
+			for prev[s].from >= 0 {
+				labels = append(labels, prev[s].olabel)
+				s = prev[s].from
+			}
+			// Reverse labels and build output string
+			for i, j := 0, len(labels)-1; i < j; i, j = i+1, j-1 {
+				labels[i], labels[j] = labels[j], labels[i]
+			}
+			var sb strings.Builder
+			for _, l := range labels {
+				if l != EpsilonLabel {
+					sb.WriteString(f.Symbols.Symbol(l))
+				}
+			}
+			return sb.String()
 		}
 
 		for _, arc := range st.Arcs {
 			nw := cur.weight + arc.Weight
-			no := cur.output + f.Symbols.Symbol(arc.OLabel)
-			if prev, ok := best[arc.Next]; !ok || nw < prev {
-				best[arc.Next] = nw
-				pq = append(pq, node{state: arc.Next, output: no, weight: nw})
+			if nw < dist[arc.Next] {
+				dist[arc.Next] = nw
+				prev[arc.Next] = backptr{olabel: arc.OLabel, from: cur.state}
+				heap.Push(h, shortestPathEntry{weight: nw, state: arc.Next})
 			}
 		}
 	}
@@ -1058,8 +1475,126 @@ func (f *Fst) ShortestPath() string {
 	return ""
 }
 
+// shortestPathEntry is a heap element for Dijkstra's algorithm.
+type shortestPathEntry struct {
+	weight float32
+	state  int32
+}
+
+// shortestPathHeap implements heap.Interface for shortestPathEntry.
+type shortestPathHeap []shortestPathEntry
+
+func (h shortestPathHeap) Len() int           { return len(h) }
+func (h shortestPathHeap) Less(i, j int) bool { return h[i].weight < h[j].weight }
+func (h shortestPathHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+
+func (h *shortestPathHeap) Push(x interface{}) {
+	*h = append(*h, x.(shortestPathEntry))
+}
+
+func (h *shortestPathHeap) Pop() interface{} {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[:n-1]
+	return x
+}
+
+// isILabelSorted checks whether all states in the FST have arcs sorted by ILabel.
+func isILabelSorted(f *Fst) bool {
+	if f == nil {
+		return false
+	}
+	if f.Props&propILabelSorted != 0 {
+		return true
+	}
+	if f.Props&propNotILabelSorted != 0 {
+		return false
+	}
+	for i := range f.States {
+		arcs := f.States[i].Arcs
+		for j := 1; j < len(arcs); j++ {
+			if arcs[j].ILabel < arcs[j-1].ILabel {
+				return false
+			}
+		}
+	}
+	return len(f.States) > 0
+}
+
+// PrepareForComposition precomputes internal indices for efficient composition.
+// Must be called after ArcSort("input"). Lazily initialized; safe to call multiple times.
+func (f *Fst) PrepareForComposition() {
+	if f.composeReady {
+		return
+	}
+
+	numStates := len(f.States)
+	f.epsArcIdx = make([][]int, numStates)
+	f.ilabelRanges = make([]ilabelRangeMap, numStates)
+
+	for s := range f.States {
+		arcs := f.States[s].Arcs
+		if len(arcs) == 0 {
+			continue
+		}
+
+		// Build epsilon arc index
+		var epsIdx []int
+		for i, arc := range arcs {
+			if arc.ILabel == EpsilonLabel {
+				epsIdx = append(epsIdx, i)
+			}
+		}
+		f.epsArcIdx[s] = epsIdx
+
+		// Build ilabel range map (for sorted arcs)
+		// Group consecutive arcs by ilabel
+		var labels []int32
+		var starts []int
+		var counts []int
+		curLabel := arcs[0].ILabel
+		curStart := 0
+		curCount := 1
+		for i := 1; i < len(arcs); i++ {
+			if arcs[i].ILabel == curLabel {
+				curCount++
+			} else {
+				labels = append(labels, curLabel)
+				starts = append(starts, curStart)
+				counts = append(counts, curCount)
+				curLabel = arcs[i].ILabel
+				curStart = i
+				curCount = 1
+			}
+		}
+		labels = append(labels, curLabel)
+		starts = append(starts, curStart)
+		counts = append(counts, curCount)
+
+		f.ilabelRanges[s] = ilabelRangeMap{
+			labels: labels,
+			starts: starts,
+			counts: counts,
+		}
+	}
+
+	f.composeReady = true
+}
+
+// =============================================================================
+// Composition types (shared by ComposeInputWithFst and ComposePrefixShortestPath)
+// =============================================================================
+
 // ComposeInputWithFst composes input with the FST and returns the shortest output.
 // Uses on-the-fly composition with int label matching.
+// Optimized with:
+//   - Precomputed epsilon arc indices (no linear scan)
+//   - Precomputed ilabel range maps (binary search)
+//   - Dense weight arrays with generation counters (fast epsilon closure)
+//   - Active state lists maintained through epsilon closure (no full scan)
+//   - Rune label cache (avoids string(r) allocation per character)
+//   - sync.Pool for scratch array reuse
 func ComposeInputWithFst(inputStr string, f *Fst, other *Fst) string {
 	if other == nil {
 		return ""
@@ -1074,137 +1609,203 @@ func ComposeInputWithFst(inputStr string, f *Fst, other *Fst) string {
 	}
 
 	runes := []rune(input)
-
-	type entry struct {
-		output string
-		weight float32
+	numRunes := len(runes)
+	numStates := len(other.States)
+	if numStates == 0 {
+		return ""
 	}
 
-	posBest := make([]map[int32]entry, len(runes)+1)
-	for i := range posBest {
-		posBest[i] = make(map[int32]entry)
+	// Ensure compose cache is ready
+	other.PrepareForComposition()
+
+	// Pre-compute input label IDs for each rune position using rune cache.
+	inputLabels := make([]int32, numRunes)
+	for i, r := range runes {
+		inputLabels[i] = other.FindRuneLabel(r)
 	}
-	posBest[0][other.Start] = entry{output: "", weight: 0}
 
-	for pos := 0; pos <= len(runes); pos++ {
-		// Epsilon closure: follow all epsilon arcs at this position
-		q := make([]int32, 0, len(posBest[pos]))
-		for s := range posBest[pos] {
-			q = append(q, s)
-		}
-		const maxEpsIter = 10000
-		epsIter := 0
-		for len(q) > 0 && epsIter < maxEpsIter {
-			s := q[0]
-			q = q[1:]
-			cur := posBest[pos][s]
-			if int(s) >= len(other.States) {
-				continue
-			}
-			st := &other.States[s]
-			if !st.HasIEpsilons() {
-				continue
-			}
-			for _, arc := range st.Arcs {
-				if arc.ILabel == EpsilonLabel {
-					nw := cur.weight + arc.Weight
-					no := cur.output + other.Symbols.Symbol(arc.OLabel)
-					prev, ok := posBest[pos][arc.Next]
-					if !ok || nw < prev.weight || (nw == prev.weight && len(no) > len(prev.output)) {
-						posBest[pos][arc.Next] = entry{output: no, weight: nw}
-						q = append(q, arc.Next)
-					}
-				}
-			}
-			epsIter++
+	// Dense weight arrays with generation counters.
+	// Pooled to avoid per-call allocation of large arrays.
+	scratch := getComposeScratch(numStates)
+	defer putComposeScratch(scratch)
+	curWeight := scratch.curWeight
+	curGen := scratch.curGen
+	nextWeight := scratch.nextWeight
+	nextGen := scratch.nextGen
+
+	// Get pooled compose context (posStates maps, active slices)
+	ctx := getComposeContext(numRunes + 1)
+	defer putComposeContext(ctx)
+	posStates := ctx.posStates
+
+	// Initialize start state
+	posStates[0][other.Start] = composeStateEntry{
+		weight: 0,
+		bp:     composeBP{fromPos: -1, fromState: -1, olabel: EpsilonLabel},
+	}
+
+	var gen uint32 = 1
+
+	// Active states at current position — maintained through epsilon closure
+	curActive := ctx.curActive
+	curActive = append(curActive, other.Start)
+
+	// Epsilon closure queue
+	epsQueue := ctx.epsQueue
+
+	for pos := 0; pos <= numRunes; pos++ {
+		// Initialize dense arrays from posStates for fast epsilon closure
+		curMap := posStates[pos]
+		for s, entry := range curMap {
+			curWeight[s] = entry.weight
+			curGen[s] = gen
 		}
 
-		if pos < len(runes) {
-			matchLabel := other.Symbols.Find(string(runes[pos]))
-			if matchLabel < 0 {
+		// Epsilon closure: follow all epsilon arcs at this position.
+		// New states discovered via epsilon are added to curActive.
+		epsQueue = epsQueue[:0]
+		epsQueue = append(epsQueue, curActive...)
+		epsHead := 0
+		for epsHead < len(epsQueue) {
+			s := epsQueue[epsHead]
+			epsHead++
+			if int(s) >= numStates {
 				continue
 			}
-			for s, cur := range posBest[pos] {
-				if int(s) >= len(other.States) {
+			curW := curWeight[s]
+			epsIdx := other.epsArcIdx[s]
+			if epsIdx == nil {
+				continue
+			}
+			arcs := other.States[s].Arcs
+			for _, idx := range epsIdx {
+				arc := &arcs[idx]
+				nw := curW + arc.Weight
+				t := arc.Next
+				if int(t) >= numStates {
 					continue
 				}
-				st := &other.States[s]
-				for _, arc := range st.Arcs {
-					if arc.ILabel == matchLabel {
-						nw := cur.weight + arc.Weight
-						no := cur.output + other.Symbols.Symbol(arc.OLabel)
-						if prev, ok := posBest[pos+1][arc.Next]; !ok || nw < prev.weight || (nw == prev.weight && len(no) > len(prev.output)) {
-							posBest[pos+1][arc.Next] = entry{output: no, weight: nw}
-						}
+				if curGen[t] != gen || nw < curWeight[t] {
+					curWeight[t] = nw
+					wasNew := curGen[t] != gen
+					curGen[t] = gen
+					epsQueue = append(epsQueue, t)
+					if wasNew {
+						curActive = append(curActive, t)
+					}
+					curMap[t] = composeStateEntry{weight: nw, bp: composeBP{fromPos: int32(pos), fromState: s, olabel: arc.OLabel}}
+				}
+			}
+		}
+
+		// Character matching: advance to next position.
+		if pos < numRunes {
+			matchLabel := inputLabels[pos]
+			if matchLabel < 0 {
+				gen++
+				curActive = curActive[:0]
+				continue
+			}
+			gen++
+			nextGen2 := gen
+			nextMap := posStates[pos+1]
+
+			for _, s := range curActive {
+				if int(s) >= numStates {
+					continue
+				}
+				curW := curWeight[s]
+				// Use precomputed ilabel range map for O(log n) lookup
+				irm := &other.ilabelRanges[s]
+				if len(irm.labels) == 0 {
+					continue
+				}
+				// Binary search on precomputed labels
+				lo, hi := 0, len(irm.labels)
+				for lo < hi {
+					mid := lo + (hi-lo)/2
+					if irm.labels[mid] < matchLabel {
+						lo = mid + 1
+					} else {
+						hi = mid
 					}
 				}
+				if lo >= len(irm.labels) || irm.labels[lo] != matchLabel {
+					continue
+				}
+				// Iterate over all arcs with this ilabel
+				arcs := other.States[s].Arcs
+				start := irm.starts[lo]
+				end := start + irm.counts[lo]
+				for i := start; i < end; i++ {
+					arc := &arcs[i]
+					nw := curW + arc.Weight
+					t := arc.Next
+					if int(t) >= numStates {
+						continue
+					}
+					if nextGen[t] != nextGen2 || nw < nextWeight[t] {
+						nextWeight[t] = nw
+						nextGen[t] = nextGen2
+						nextMap[t] = composeStateEntry{weight: nw, bp: composeBP{fromPos: int32(pos), fromState: s, olabel: arc.OLabel}}
+					}
+				}
+			}
+
+			// Prepare next active states
+			curActive = curActive[:0]
+			for s := range nextMap {
+				curActive = append(curActive, s)
 			}
 		}
 	}
 
 	// Find best final state at the end position.
-	// Only consider states with Final=true as valid end states.
-	// States with len(Arcs)==0 but Final=false are dead ends (partial matches)
-	// and should not be considered as valid outputs.
 	minWeight := float32(1e30)
-	bestOutput := ""
 	bestEndState := int32(-1)
 
-	for s, cur := range posBest[len(runes)] {
-		if int(s) < len(other.States) {
-			st := &other.States[s]
-			if st.Final {
-				totalW := cur.weight + st.Weight
-				if totalW < minWeight || (totalW == minWeight && len(cur.output) > len(bestOutput)) {
-					minWeight = totalW
-					bestOutput = cur.output
-					bestEndState = s
-				}
+	for s, entry := range posStates[numRunes] {
+		if int(s) < numStates && other.States[s].Final {
+			totalW := entry.weight + other.States[s].Weight
+			if totalW < minWeight {
+				minWeight = totalW
+				bestEndState = s
 			}
 		}
 	}
 
-	// Follow epsilon chains from the best final state to collect any
-	// trailing epsilon output labels (e.g., from Insert operations).
-	// Only follow epsilon chains that lead to a final state.
-	if bestEndState >= 0 {
-		type epsEntry struct {
-			state  int32
-			output string
-		}
-		const maxEpsFollow = 50000
-		epsVisited := map[int32]string{bestEndState: bestOutput}
-		epsQ := []epsEntry{{state: bestEndState, output: bestOutput}}
-		for len(epsQ) > 0 && len(epsVisited) < maxEpsFollow {
-			be := epsQ[0]
-			epsQ = epsQ[1:]
-			if int(be.state) >= len(other.States) {
-				continue
-			}
-			st := &other.States[be.state]
-			if !st.HasIEpsilons() {
-				continue
-			}
-			for _, arc := range st.Arcs {
-				if arc.ILabel == EpsilonLabel {
-					no := be.output + other.Symbols.Symbol(arc.OLabel)
-					prev, seen := epsVisited[arc.Next]
-					if !seen || len(no) > len(prev) {
-						epsVisited[arc.Next] = no
-						epsQ = append(epsQ, epsEntry{state: arc.Next, output: no})
-						// Only update bestOutput if the epsilon chain leads to a final state
-						if int(arc.Next) < len(other.States) && other.States[arc.Next].Final {
-							if len(no) > len(bestOutput) {
-								bestOutput = no
-							}
-						}
-					}
-				}
-			}
-		}
+	if bestEndState < 0 {
+		return ""
 	}
 
-	return bestOutput
+	// Reconstruct output by following backpointers from the best final state.
+	var olabels []int32
+	curState := bestEndState
+	curPos := int32(numRunes)
+	for {
+		entry, ok := posStates[curPos][curState]
+		if !ok || entry.bp.fromPos < 0 {
+			break
+		}
+		if entry.bp.olabel != EpsilonLabel {
+			olabels = append(olabels, entry.bp.olabel)
+		}
+		curState = entry.bp.fromState
+		curPos = entry.bp.fromPos
+	}
+
+	// Reverse and build output string
+	if len(olabels) == 0 {
+		return ""
+	}
+	for i, j := 0, len(olabels)-1; i < j; i, j = i+1, j-1 {
+		olabels[i], olabels[j] = olabels[j], olabels[i]
+	}
+	var sb strings.Builder
+	for _, l := range olabels {
+		sb.WriteString(other.Symbols.Symbol(l))
+	}
+	return sb.String()
 }
 
 // ComposePrefixResult holds the result of a prefix composition.
@@ -1217,153 +1818,250 @@ type ComposePrefixResult struct {
 // ComposePrefixShortestPath composes the input string with the FST and finds
 // the best match that consumes a prefix of the input. Returns the output,
 // the number of input characters consumed, and the weight.
+// Optimized with:
+//   - Precomputed epsilon arc indices and ilabel range maps
+//   - Reusable scratch weight arrays (no per-call allocation)
+//   - Active state lists maintained through epsilon closure (no full scan)
+//   - Rune label cache (avoids string(r) allocation per character)
 func ComposePrefixShortestPath(inputStr string, other *Fst) ComposePrefixResult {
 	if other == nil || inputStr == "" {
 		return ComposePrefixResult{}
 	}
 
 	runes := []rune(inputStr)
-
-	type entry struct {
-		output string
-		weight float32
+	numRunes := len(runes)
+	numStates := len(other.States)
+	if numStates == 0 {
+		return ComposePrefixResult{}
 	}
 
-	posBest := make([]map[int32]entry, len(runes)+1)
-	for i := range posBest {
-		posBest[i] = make(map[int32]entry)
+	// Ensure compose cache is ready
+	other.PrepareForComposition()
+
+	// Pre-compute input label IDs using rune cache
+	inputLabels := make([]int32, numRunes)
+	for i, r := range runes {
+		inputLabels[i] = other.FindRuneLabel(r)
 	}
-	posBest[0][other.Start] = entry{output: "", weight: 0}
+
+	// Dense weight arrays with generation counters for epsilon closure
+	// Pooled to avoid per-call allocation of large arrays.
+	scratch := getComposeScratch(numStates)
+	defer putComposeScratch(scratch)
+	curWeight := scratch.curWeight
+	curGen := scratch.curGen
+	nextWeight := scratch.nextWeight
+	nextGen := scratch.nextGen
+
+	var gen uint32 = 1
+
+	// Get pooled compose context (posStates maps, active slices)
+	ctx := getComposeContext(numRunes + 1)
+	defer putComposeContext(ctx)
+	posStates := ctx.posStates
+
+	// Initialize start state
+	posStates[0][other.Start] = composeStateEntry{
+		weight: 0,
+		bp:     composeBP{fromPos: -1, fromState: -1, olabel: EpsilonLabel},
+	}
+
+	// Active states at current position
+	curActive := ctx.curActive
+	curActive = append(curActive, other.Start)
 
 	// Track the best final match at each position
 	bestConsumed := 0
-	bestOutput := ""
+	bestEndState := int32(-1)
 	bestWeight := float32(1e30)
 
-	for pos := 0; pos <= len(runes); pos++ {
-		// Epsilon closure
-		q := make([]int32, 0, len(posBest[pos]))
-		for s := range posBest[pos] {
-			q = append(q, s)
+	epsQueue := ctx.epsQueue
+
+	for pos := 0; pos <= numRunes; pos++ {
+		// Initialize dense arrays from posStates
+		curMap := posStates[pos]
+		for s, entry := range curMap {
+			curWeight[s] = entry.weight
+			curGen[s] = gen
 		}
-		const maxEpsIter = 10000
-		epsIter := 0
-		for len(q) > 0 && epsIter < maxEpsIter {
-			s := q[0]
-			q = q[1:]
-			cur := posBest[pos][s]
-			if int(s) >= len(other.States) {
+
+		// Epsilon closure
+		epsQueue = epsQueue[:0]
+		epsQueue = append(epsQueue, curActive...)
+		epsHead := 0
+		for epsHead < len(epsQueue) {
+			s := epsQueue[epsHead]
+			epsHead++
+			if int(s) >= numStates {
 				continue
 			}
-			st := &other.States[s]
-			if !st.HasIEpsilons() {
+			curW := curWeight[s]
+			epsIdx := other.epsArcIdx[s]
+			if epsIdx == nil {
 				continue
 			}
-			for _, arc := range st.Arcs {
-				if arc.ILabel == EpsilonLabel {
-					nw := cur.weight + arc.Weight
-					no := cur.output + other.Symbols.Symbol(arc.OLabel)
-					prev, ok := posBest[pos][arc.Next]
-					if !ok || nw < prev.weight {
-						posBest[pos][arc.Next] = entry{output: no, weight: nw}
-						q = append(q, arc.Next)
+			arcs := other.States[s].Arcs
+			for _, idx := range epsIdx {
+				arc := &arcs[idx]
+				nw := curW + arc.Weight
+				t := arc.Next
+				if int(t) >= numStates {
+					continue
+				}
+				if curGen[t] != gen || nw < curWeight[t] {
+					curWeight[t] = nw
+					wasNew := curGen[t] != gen
+					curGen[t] = gen
+					epsQueue = append(epsQueue, t)
+					if wasNew {
+						curActive = append(curActive, t)
 					}
+					newBP := composeBP{fromPos: int32(pos), fromState: s, olabel: arc.OLabel}
+					curMap[t] = composeStateEntry{weight: nw, bp: newBP}
 				}
 			}
-			epsIter++
 		}
 
 		// Check for final states at this position
-		for s, cur := range posBest[pos] {
-			if int(s) < len(other.States) && other.States[s].Final {
-				totalW := cur.weight + other.States[s].Weight
-				// Prefer longer match; for same length, prefer lower weight
+		for _, s := range curActive {
+			if int(s) < numStates && other.States[s].Final {
+				entry := curMap[s]
+				totalW := entry.weight + other.States[s].Weight
 				if pos > bestConsumed || (pos == bestConsumed && totalW < bestWeight) {
 					bestWeight = totalW
-					bestOutput = cur.output
 					bestConsumed = pos
+					bestEndState = s
 				}
 			}
 		}
 
-		if pos < len(runes) {
-			matchLabel := other.Symbols.Find(string(runes[pos]))
+		if pos < numRunes {
+			matchLabel := inputLabels[pos]
 			if matchLabel < 0 {
+				gen++
+				curActive = curActive[:0]
 				continue
 			}
-			for s, cur := range posBest[pos] {
-				if int(s) >= len(other.States) {
+			gen++
+			nextGen2 := gen
+			nextMap := posStates[pos+1]
+
+			for _, s := range curActive {
+				if int(s) >= numStates {
 					continue
 				}
-				st := &other.States[s]
-				for _, arc := range st.Arcs {
-					if arc.ILabel == matchLabel {
-						nw := cur.weight + arc.Weight
-						no := cur.output + other.Symbols.Symbol(arc.OLabel)
-						if prev, ok := posBest[pos+1][arc.Next]; !ok || nw < prev.weight {
-							posBest[pos+1][arc.Next] = entry{output: no, weight: nw}
-						}
+				curW := curWeight[s]
+				irm := &other.ilabelRanges[s]
+				if len(irm.labels) == 0 {
+					continue
+				}
+				lo, hi := 0, len(irm.labels)
+				for lo < hi {
+					mid := lo + (hi-lo)/2
+					if irm.labels[mid] < matchLabel {
+						lo = mid + 1
+					} else {
+						hi = mid
 					}
 				}
+				if lo >= len(irm.labels) || irm.labels[lo] != matchLabel {
+					continue
+				}
+				arcs := other.States[s].Arcs
+				start := irm.starts[lo]
+				end := start + irm.counts[lo]
+				for i := start; i < end; i++ {
+					arc := &arcs[i]
+					nw := curW + arc.Weight
+					t := arc.Next
+					if int(t) >= numStates {
+						continue
+					}
+					if nextGen[t] != nextGen2 || nw < nextWeight[t] {
+						nextWeight[t] = nw
+						nextGen[t] = nextGen2
+						newBP := composeBP{fromPos: int32(pos), fromState: s, olabel: arc.OLabel}
+						nextMap[t] = composeStateEntry{weight: nw, bp: newBP}
+					}
+				}
+			}
+
+			// Prepare next active states
+			curActive = curActive[:0]
+			for s := range nextMap {
+				curActive = append(curActive, s)
 			}
 		}
 	}
 
-	// Follow epsilon chains from the best final state
-	if bestConsumed > 0 {
-		// Find the best final state at bestConsumed position
-		bestState := int32(-1)
-		bestStateWeight := float32(1e30)
-		for s, cur := range posBest[bestConsumed] {
-			if int(s) < len(other.States) && other.States[s].Final {
-				totalW := cur.weight + other.States[s].Weight
-				if totalW < bestStateWeight {
-					bestStateWeight = totalW
-					bestState = s
-				}
-			}
+	if bestEndState < 0 || bestConsumed == 0 {
+		return ComposePrefixResult{}
+	}
+
+	// Reconstruct output by following backpointers from the best final state.
+	var olabels []int32
+	curState := bestEndState
+	curPos := int32(bestConsumed)
+	for {
+		entry, ok := posStates[curPos][curState]
+		if !ok || entry.bp.fromPos < 0 {
+			break
 		}
-		if bestState >= 0 {
-			type epsEntry struct {
-				state  int32
-				output string
-			}
-			epsVisited := map[int32]string{bestState: bestOutput}
-			epsQ := []epsEntry{{state: bestState, output: bestOutput}}
-			for len(epsQ) > 0 && len(epsVisited) < 50000 {
-				be := epsQ[0]
-				epsQ = epsQ[1:]
-				if int(be.state) >= len(other.States) {
-					continue
-				}
-				st := &other.States[be.state]
-				if !st.HasIEpsilons() {
-					continue
-				}
-				for _, arc := range st.Arcs {
-					if arc.ILabel == EpsilonLabel {
-						no := be.output + other.Symbols.Symbol(arc.OLabel)
-						prev, seen := epsVisited[arc.Next]
-						if !seen || len(no) > len(prev) {
-							epsVisited[arc.Next] = no
-							epsQ = append(epsQ, epsEntry{state: arc.Next, output: no})
-							if int(arc.Next) < len(other.States) && other.States[arc.Next].Final {
-								if len(no) > len(bestOutput) {
-									bestOutput = no
-								}
-							}
-						}
-					}
-				}
-			}
+		if entry.bp.olabel != EpsilonLabel {
+			olabels = append(olabels, entry.bp.olabel)
 		}
+		curState = entry.bp.fromState
+		curPos = entry.bp.fromPos
+	}
+
+	var output string
+	if len(olabels) > 0 {
+		for i, j := 0, len(olabels)-1; i < j; i, j = i+1, j-1 {
+			olabels[i], olabels[j] = olabels[j], olabels[i]
+		}
+		var sb strings.Builder
+		for _, l := range olabels {
+			sb.WriteString(other.Symbols.Symbol(l))
+		}
+		output = sb.String()
 	}
 
 	return ComposePrefixResult{
-		Output:   bestOutput,
+		Output:   output,
 		Consumed: bestConsumed,
 		Weight:   bestWeight,
 	}
+}
+
+// ComposePrefixShortestPathWithMaxLen is like ComposePrefixShortestPath but
+// limits the search depth to maxLen characters. When maxLen > 0, only the
+// first maxLen characters of the input are considered.
+func ComposePrefixShortestPathWithMaxLen(inputStr string, other *Fst, maxLen int) ComposePrefixResult {
+	if other == nil || inputStr == "" {
+		return ComposePrefixResult{}
+	}
+
+	runes := []rune(inputStr)
+	effectiveRunes := len(runes)
+	if maxLen > 0 && maxLen < effectiveRunes {
+		effectiveRunes = maxLen
+	}
+
+	// Truncate the input string to the effective length
+	truncated := string(runes[:effectiveRunes])
+	return ComposePrefixShortestPath(truncated, other)
+}
+
+// ComposePrefixShortestPathWithLabels is like ComposePrefixShortestPath but
+// accepts pre-computed input label IDs. Note: the inputLabels must be computed
+// using the same FST's symbol table as `other`, otherwise results will be incorrect.
+func ComposePrefixShortestPathWithLabels(inputStr string, inputLabels []int32, other *Fst) ComposePrefixResult {
+	if other == nil || len(inputLabels) == 0 {
+		return ComposePrefixResult{}
+	}
+	// Fall back to regular ComposePrefixShortestPath since label IDs
+	// are FST-specific and cannot be shared across different FSTs.
+	return ComposePrefixShortestPath(inputStr, other)
 }
 func (f *Fst) ComposeShortestPath(other *Fst) string {
 	if f == nil || other == nil {
@@ -1408,6 +2106,139 @@ func extractLinearInput(f *Fst) string {
 // =============================================================================
 // Gob encoding registration
 // =============================================================================
+
+// composeBP stores backpointer information for path reconstruction.
+type composeBP struct {
+	fromPos   int32
+	fromState int32
+	olabel    int32
+}
+
+// composeStateEntry stores weight and backpointer for a state at a position.
+type composeStateEntry struct {
+	weight float32
+	bp     composeBP
+}
+
+// composeContext holds reusable per-call state for composition operations.
+// Pooled via sync.Pool to avoid massive per-call allocation of posStates maps.
+type composeContext struct {
+	posStates  []map[int32]composeStateEntry
+	curActive  []int32
+	epsQueue   []int32
+	nextActive []int32
+}
+
+var composeContextPool = sync.Pool{
+	New: func() interface{} {
+		return &composeContext{}
+	},
+}
+
+// maxMapReuseCap is the maximum number of entries a reused map may have
+// before we discard it and allocate a fresh smaller one.
+const maxMapReuseCap = 128
+
+// getComposeContext returns a composeContext from the pool, ensuring it has
+// enough posStates maps for numPositions positions. Existing maps are cleared
+// (entries deleted) rather than reallocated.
+func getComposeContext(numPositions int) *composeContext {
+	ctx := composeContextPool.Get().(*composeContext)
+
+	// Ensure posStates slice is long enough
+	if len(ctx.posStates) < numPositions {
+		// Extend the slice
+		oldLen := len(ctx.posStates)
+		ctx.posStates = append(ctx.posStates, make([]map[int32]composeStateEntry, numPositions-oldLen)...)
+	}
+	posStates := ctx.posStates[:numPositions]
+
+	// Clear each map: delete all entries, or replace if too large
+	for i := range posStates {
+		m := posStates[i]
+		if m == nil {
+			if i == 0 {
+				m = make(map[int32]composeStateEntry, 16)
+			} else {
+				m = make(map[int32]composeStateEntry, 8)
+			}
+			posStates[i] = m
+		} else if len(m) > 0 {
+			if len(m) > maxMapReuseCap {
+				// Map grew too large; replace with a fresh smaller one
+				if i == 0 {
+					posStates[i] = make(map[int32]composeStateEntry, 16)
+				} else {
+					posStates[i] = make(map[int32]composeStateEntry, 8)
+				}
+			} else {
+				// Clear by deleting all entries (cheaper than reallocating)
+				for k := range m {
+					delete(m, k)
+				}
+			}
+		}
+	}
+
+	// Reset slices (keep capacity)
+	ctx.curActive = ctx.curActive[:0]
+	ctx.epsQueue = ctx.epsQueue[:0]
+	if ctx.nextActive == nil {
+		ctx.nextActive = make([]int32, 0, 128)
+	} else {
+		ctx.nextActive = ctx.nextActive[:0]
+	}
+
+	return ctx
+}
+
+func putComposeContext(ctx *composeContext) {
+	composeContextPool.Put(ctx)
+}
+
+// composeScratch holds reusable arrays for composition operations.
+// Pooled via sync.Pool to avoid per-call allocation of large arrays.
+type composeScratch struct {
+	curWeight  []float32
+	curGen     []uint32
+	nextWeight []float32
+	nextGen    []uint32
+}
+
+var composeScratchPool = sync.Pool{
+	New: func() interface{} {
+		return &composeScratch{}
+	},
+}
+
+func getComposeScratch(numStates int) *composeScratch {
+	s := composeScratchPool.Get().(*composeScratch)
+	// Ensure arrays are large enough (grow if needed, but don't shrink)
+	if cap(s.curWeight) < numStates {
+		s.curWeight = make([]float32, numStates)
+		s.curGen = make([]uint32, numStates)
+		s.nextWeight = make([]float32, numStates)
+		s.nextGen = make([]uint32, numStates)
+	} else {
+		// Reuse existing capacity — just set length
+		s.curWeight = s.curWeight[:numStates]
+		s.curGen = s.curGen[:numStates]
+		s.nextWeight = s.nextWeight[:numStates]
+		s.nextGen = s.nextGen[:numStates]
+		// Zero the gen arrays to avoid stale generation matches
+		for i := range s.curGen {
+			s.curGen[i] = 0
+		}
+		for i := range s.nextGen {
+			s.nextGen[i] = 0
+		}
+	}
+	return s
+}
+
+func putComposeScratch(s *composeScratch) {
+	composeScratchPool.Put(s)
+}
 
 func init() {
 	gob.Register(&Fst{})

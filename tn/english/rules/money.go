@@ -69,13 +69,15 @@ func (m *Money) BuildVerbalizer() {
 	keepSpace := pynini.Accep(" ")
 	maj := lib.DeleteString("currency_maj: \"").Concat(m.NOT_QUOTE.Plus()).Concat(lib.DeleteString("\""))
 
-	_ = lib.DeleteString("fractional_part: \"").Concat(m.NOT_QUOTE.Plus()).Concat(lib.DeleteString("\"")) // fractionalPart reference
-
 	integerPart := decimal.DELETE_SPACE.Concat(
 		lib.DeleteString("\"")).Concat(decimal.NOT_QUOTE.Star()).Concat(lib.DeleteString("\""))
 
+	// graph_integer: integer_part + space + currency_maj
 	graphInteger := integerPart.Concat(keepSpace).Concat(maj)
-	graphDecimal := decimal.OptionalSign.Concat(decimal.Integer).Concat(keepSpace).Concat(maj)
+
+	// graph_decimal: decimal.numbers (optional_sign + integer + fractional_part) + space + currency_maj
+	// Matching Python: decimal.numbers + keep_space + maj
+	graphDecimal := decimal.Numbers.Concat(keepSpace).Concat(maj)
 
 	graph := graphInteger.Union(graphDecimal)
 	deleteTokens := m.DeleteTokens(graph)

@@ -57,10 +57,17 @@ func (w *Whitelist) BuildTagger() {
 		)
 	}
 
+	// Matching Python: self.UPPER + pynini.closure(pynutil.delete(x) + self.UPPER, 2) + pynutil.delete(".").ques
+	// This matches abbreviations like "U.S.A.", "Ph.D." (at least 3 uppercase letters)
+	// Python: closure(F, 2) = F{2,} = at least 2 repetitions
 	for _, x := range []string{".", ". "} {
+		abbrevPart := lib.DeleteString(x).Concat(w.UPPER) // delete(x) + UPPER
 		graph = graph.Union(
-			w.UPPER.Concat(lib.DeleteString(x).Plus()).Concat(
-				lib.DeleteString(".").Ques()),
+			w.UPPER.Concat(
+				abbrevPart.Repeat(2).Concat(abbrevPart.Star()), // (delete(x) + UPPER){2,}
+			).Concat(
+				lib.DeleteString(".").Ques(),
+			),
 		)
 	}
 

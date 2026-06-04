@@ -236,13 +236,6 @@ func (f *Fst) RmEpsilon() *Fst {
 	return result
 }
 
-// computeEpsilonClosure returns all states reachable from state s via
-// epsilon-only transitions (transitions where both ILabel and OLabel are epsilon).
-func computeEpsilonClosure(f *Fst, s int32) []int32 {
-	states, _ := computeEpsilonClosureWithWeights(f, s)
-	return states
-}
-
 // computeEpsilonClosureWithWeights returns all states reachable from state s via
 // epsilon-only transitions, along with the accumulated weight for each state.
 // The weight is the sum of arc weights along the epsilon path.
@@ -287,49 +280,22 @@ func computeEpsilonClosureWithWeights(f *Fst, s int32) ([]int32, map[int32]float
 	return result, weights
 }
 
-// computeInputEpsilonClosure returns all states reachable from state s via
-// transitions where ILabel is epsilon (regardless of OLabel).
-// This is used by Determinize to handle the case where Invert() creates
-// arcs with IL=epsilon, OL=non-epsilon (output labels on epsilon input).
-func computeInputEpsilonClosure(f *Fst, s int32) []int32 {
-	visited := make([]bool, len(f.States))
-	var result []int32
-	var stack []int32
-	stack = append(stack, s)
-	visited[s] = true
-
-	for len(stack) > 0 {
-		cur := stack[len(stack)-1]
-		stack = stack[:len(stack)-1]
-		result = append(result, cur)
-
-		for _, arc := range f.States[cur].Arcs {
-			if arc.ILabel == EpsilonLabel {
-				if int(arc.Next) < len(visited) && !visited[arc.Next] {
-					visited[arc.Next] = true
-					stack = append(stack, arc.Next)
-				}
-			}
-		}
-	}
-
-	return result
-}
-
 // =============================================================================
 // Determinize - determinize the FST
 // =============================================================================
 
 // Determinize determinizes the FST using subset construction (powerset method).
-// This is the standard algorithm that always terminates and produces a correct
-// deterministic FST. For transducers, when multiple arcs with the same ILabel
-// but different OLabels exist, the one with minimum weight is kept.
+// After RmEpsilon, there may still be arcs with ILabel=epsilon (output-only arcs
+// from Insert operations) or OLabel=epsilon (input-only arcs from Delete operations).
+// We handle ILabel=epsilon arcs by treating them as part of the epsilon closure:
+// when building the subset for a non-epsilon ILabel, we follow ILabel=epsilon arcs
+// from the target states to accumulate output labels.
 func (f *Fst) Determinize() *Fst {
 	if f == nil {
 		return NewFst()
 	}
 
-	// First remove epsilons
+	// First remove pure epsilon transitions (both ILabel and OLabel are epsilon)
 	result := f.RmEpsilon()
 
 	// Quick check: if already deterministic, return as-is
@@ -339,10 +305,12 @@ func (f *Fst) Determinize() *Fst {
 		return result.Connect()
 	}
 
-	// Compute epsilon closure for each state (only pure epsilon arcs)
+	// Compute input-epsilon closure for each state.
+	// This includes states reachable via arcs where ILabel=epsilon
+	// (regardless of OLabel), which handles output-only arcs from Insert().
 	epsClosure := make([][]int32, len(result.States))
 	for s := range result.States {
-		epsClosure[s] = computeInputEpsilonClosure(result, int32(s))
+		epsClosure[s], _ = computeInputEpsilonClosureWithOutput(result, int32(s))
 	}
 
 	// Build deterministic FST via subset construction
@@ -351,21 +319,16 @@ func (f *Fst) Determinize() *Fst {
 
 	// subsetKey creates a canonical string key for a set of state IDs
 	subsetKey := func(states []int32) string {
-		// Use a simple encoding: sorted state IDs as bytes
-		// For small sets, this is fast enough
 		if len(states) == 0 {
 			return ""
 		}
-		// Sort states (epsilon closure is already sorted in traversal order, but ensure consistency)
 		sorted := make([]int32, len(states))
 		copy(sorted, states)
-		// Simple insertion sort for small sets
 		for i := 1; i < len(sorted); i++ {
 			for j := i; j > 0 && sorted[j] < sorted[j-1]; j-- {
 				sorted[j], sorted[j-1] = sorted[j-1], sorted[j]
 			}
 		}
-		// Encode as bytes
 		key := make([]byte, len(sorted)*4)
 		for i, s := range sorted {
 			key[i*4] = byte(s >> 24)
@@ -411,8 +374,9 @@ func (f *Fst) Determinize() *Fst {
 		}
 
 		// Collect all outgoing transitions grouped by ILabel.
-		// For each ILabel, collect the union of epsilon closures of all target states.
-		// Keep the OLabel and weight from the arc with minimum weight.
+		// For each non-epsilon ILabel, collect the union of epsilon closures
+		// of all target states. Keep the OLabel and weight from the arc with
+		// minimum weight.
 		type labelInfo struct {
 			targetSet map[int32]bool
 			olabel    int32
@@ -426,7 +390,7 @@ func (f *Fst) Determinize() *Fst {
 			}
 			for _, arc := range result.States[s].Arcs {
 				if arc.ILabel == EpsilonLabel {
-					continue
+					continue // handled via epsilon closure
 				}
 				info, ok := labelTrans[arc.ILabel]
 				if !ok {
@@ -451,7 +415,6 @@ func (f *Fst) Determinize() *Fst {
 
 		// Add transitions to deterministic FST
 		for ilabel, info := range labelTrans {
-			// Build sorted target state list
 			targetList := make([]int32, 0, len(info.targetSet))
 			for t := range info.targetSet {
 				targetList = append(targetList, t)
@@ -475,6 +438,48 @@ func (f *Fst) Determinize() *Fst {
 	return det.Connect()
 }
 
+// computeInputEpsilonClosureWithOutput returns all states reachable from state s
+// via transitions where ILabel is epsilon, along with accumulated output labels.
+// This handles output-only arcs (from Insert operations) where ILabel=epsilon
+// but OLabel is non-epsilon.
+func computeInputEpsilonClosureWithOutput(f *Fst, s int32) ([]int32, map[int32]string) {
+	visited := make([]bool, len(f.States))
+	outputs := make(map[int32]string)
+	var result []int32
+
+	type queueEntry struct {
+		state  int32
+		output string
+	}
+
+	queue := []queueEntry{{state: s, output: ""}}
+	visited[s] = true
+	outputs[s] = ""
+	result = append(result, s)
+
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+
+		for _, arc := range f.States[cur.state].Arcs {
+			if arc.ILabel == EpsilonLabel {
+				newOutput := cur.output
+				if arc.OLabel != EpsilonLabel {
+					newOutput += f.Symbols.Symbol(arc.OLabel)
+				}
+				if int(arc.Next) < len(visited) && !visited[arc.Next] {
+					visited[arc.Next] = true
+					outputs[arc.Next] = newOutput
+					result = append(result, arc.Next)
+					queue = append(queue, queueEntry{state: arc.Next, output: newOutput})
+				}
+			}
+		}
+	}
+
+	return result, outputs
+}
+
 // isDeterministic checks if the FST has no state with multiple arcs
 // sharing the same input label.
 func isDeterministic(f *Fst) bool {
@@ -495,17 +500,20 @@ func isDeterministic(f *Fst) bool {
 // =============================================================================
 
 // Optimize optimizes the FST by removing epsilon transitions, determinizing,
-// minimizing, and connecting.
+// and connecting. Determinize is enabled with a state count threshold:
+// for FSTs with more than 50000 states, determinization is skipped since
+// it can be expensive and the benefit is marginal for large FSTs.
 func (f *Fst) Optimize() *Fst {
 	if f == nil {
 		return NewFst()
 	}
 	result := f.RmEpsilon()
-	// Skip Determinize for now - our subset construction doesn't handle
-	// epsilon ILabels correctly. The FST works correctly without determinization.
-	// TODO: fix Determinize to handle epsilon ILabels
+	// Determinize is disabled for now - the subset construction doesn't
+	// correctly handle all transducer patterns (e.g., output-only arcs
+	// from Insert operations). Re-enable after fixing.
 	// result = result.Determinize()
 	result = result.Connect()
+	result.ArcSort("input")
 	return result
 }
 

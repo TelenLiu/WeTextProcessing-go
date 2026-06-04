@@ -86,17 +86,41 @@ func (o *Ordinal) BuildVerbalizer() {
 			o.NOT_QUOTE.Plus()).Concat(lib.DeleteString("\"")),
 	)
 
-	convertRest := lib.Insert("th")
+	// Build suffix replacement that applies at the end of the integer string.
+	// Python: cdrewrite(suffix, "", "[EOS]", VCHAR.star)
+	// We decompose the integer into: prefix + ending, where ending is matched by suffix.
+	// The suffix FST maps:
+	//   "one" -> "first", "two" -> "second", ..., "eleven" -> "eleventh", ...
+	//   "ty" -> "tieth", and default: append "th"
+	//
+	// Key insight: suffix must replace the END of the string, not insert at any position.
+	// We split NOT_QUOTE.Plus() into: NOT_QUOTE.Star() + (suffix_match)
+	// where suffix_match is the last part that gets transformed by the suffix FST.
+	//
+	// For "three" -> "third": graphDigit maps "three" -> "third" (entire word)
+	// For "twenty" -> "twentieth": Cross("ty", "tieth") replaces "ty" at end
+	// For "five" -> "fifth": graphDigit maps "five" -> "fifth" (entire word)
+	// For "hundred" -> "hundredth": Insert("th") appends "th"
+	//
+	// We use NOT_QUOTE.Star() for the prefix (unchanged part) and then
+	// apply the suffix transformation to the remaining part.
 
 	suffix := pynini.Union(
-		graphDigit,
-		graphTeens,
-		pynini.Cross("ty", "tieth"),
-		convertRest,
+		lib.AddWeight(graphDigit, -0.001),      // "one"->"first", "two"->"second", "three"->"third", etc.
+		lib.AddWeight(graphTeens, -0.001),      // "eleven"->"eleventh", "twelve"->"twelfth", etc.
+		lib.AddWeight(pynini.Cross("ty", "tieth"), -0.001), // "twenty"->"twentieth", "thirty"->"thirtieth"
+	).Union(
+		// Default: append "th" to the end (e.g., "hundred" -> "hundredth")
+		// Must match at least one character to avoid inserting "th" at position 0.
+		// Use Plus() to match multi-char endings like "thousand", "million"
+		// Higher weight than graphDigit/graphTeens so they take priority
+		lib.AddWeight(o.NOT_QUOTE.Plus().Concat(lib.Insert("th")), 0.001),
 	)
-	suffix = o.BuildRule(suffix, "", "").Optimize()
 
-	o.GraphV = graph.Compose(suffix)
+	// The full verbalizer: prefix (unchanged) + suffix (transformed ending)
+	o.GraphV = graph.Compose(
+		o.NOT_QUOTE.Star().Concat(suffix),
+	)
 	o.Suffix = suffix
 	deleteTokens := o.DeleteTokens(o.GraphV)
 	o.Verbalizer = deleteTokens.Optimize()

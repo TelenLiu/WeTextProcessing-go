@@ -67,40 +67,60 @@ func (f *Fraction) BuildVerbalizer() {
 	integer := lib.DeleteString("integer_part: \"").Concat(
 		f.NOT_QUOTE.Star()).Concat(lib.DeleteString("\" "))
 
-	denominatorOne := pynini.Cross("denominator: \"one\"", "over one")
-	denominatorHalf := pynini.Cross("denominator: \"two\"", "half")
-	denominatorQuarter := pynini.Cross("denominator: \"four\"", "quarter")
+	// Build denominator verbalization
+	// For numerator "one": use singular (half, quarter, third, fifth, etc.)
+	// For numerator != "one": use plural (halves, quarters, thirds, fifths, etc.)
 
-	denominatorRest := lib.DeleteString("denominator: \"").Concat(
+	// Singular denominators - with priority weights matching Python's _priority_union
+	denominatorOne := pynini.Cross("denominator: \"one\"", "over one")
+	denominatorHalf := lib.AddWeight(pynini.Cross("denominator: \"two\"", "half"), -0.0001)
+	denominatorQuarter := lib.AddWeight(pynini.Cross("denominator: \"four\"", "quarter"), -0.0001)
+	// Other singular: apply ordinal suffix (e.g., "three" -> "third", "five" -> "fifth")
+	denominatorRestSingular := lib.DeleteString("denominator: \"").Concat(
 		f.NOT_QUOTE.Star().Compose(suffix)).Concat(lib.DeleteString("\""))
 
-	denominators := pynini.Union(
+	denominatorsSingular := pynini.Union(
 		denominatorOne,
 		denominatorHalf,
 		denominatorQuarter,
-		denominatorRest,
+		denominatorRestSingular,
 	).Optimize()
 
-	if !f.deterministic {
-		graphFour, _ := pynini.StringFile(tn.EnglishDataPath("data/ordinal/digit.tsv"))
-		graphFour = graphFour.Invert()
-		denominators = denominators.Union(
-			lib.DeleteString("denominator: \"").Concat(
-				pynini.Accep("four").Compose(graphFour)).Concat(lib.DeleteString("\"")),
-		)
-	}
+	// Plural denominators - with priority weights matching Python's _priority_union
+	denominatorHalves := lib.AddWeight(pynini.Cross("denominator: \"two\"", "halves"), -0.0001)
+	denominatorQuarters := lib.AddWeight(pynini.Cross("denominator: \"four\"", "quarters"), -0.0001)
+	// Other plural: apply ordinal suffix + "s" (e.g., "three" -> "thirds", "five" -> "fifths")
+	denominatorRestPlural := lib.DeleteString("denominator: \"").Concat(
+		f.NOT_QUOTE.Star().Compose(suffix)).Concat(
+		lib.Insert("s")).Concat(lib.DeleteString("\""))
 
-	// Optimized: avoid Difference which is slow on large FSTs
-	// Use separate patterns for "one" and "not one"
-	numeratorOne := lib.DeleteString("numerator: \"one\"").Concat(
-		f.INSERT_SPACE).Concat(denominators)
+	denominatorsPlural := pynini.Union(
+		denominatorOne,
+		denominatorHalves,
+		denominatorQuarters,
+		denominatorRestPlural,
+	).Optimize()
 
-	// For numerator rest, just match any content (skip the half->halves cdrewrite for now)
-	numeratorRest := lib.DeleteString("numerator: \"").Concat(
-		f.NOT_QUOTE.Star()).Concat(lib.DeleteString("\" ")).Concat(
-		f.INSERT_SPACE).Concat(denominators)
+	// Build two separate verbalizer paths:
+	// Path 1: numerator is "one" -> keep "one" in output + singular denominators
+	// Path 2: numerator is not "one" -> keep numerator in output + plural denominators
+	// Python: numerator_one = delete('numerator: "') + accep("one") + delete('" ')
 
-	graph := numeratorOne.Union(numeratorRest)
+	// Path 1: numerator "one" with singular denominators
+	// Keep "one" in output (matching Python: pynini.accep("one"))
+	pathOne := lib.AddWeight(
+		lib.DeleteString("numerator: \"").Concat(
+			pynini.Accep("one")).Concat(lib.DeleteString("\" ")).Concat(
+			f.INSERT_SPACE).Concat(denominatorsSingular),
+		-1.0,
+	)
+
+	// Path 2: numerator != "one" with plural denominators
+	pathRest := lib.DeleteString("numerator: \"").Concat(
+		f.NOT_QUOTE.Plus()).Concat(lib.DeleteString("\" ")).Concat(
+		f.INSERT_SPACE).Concat(denominatorsPlural)
+
+	graph := pathOne.Union(pathRest)
 	conjunction := lib.Insert("and ")
 	integer = integer.Concat(f.INSERT_SPACE).Concat(conjunction).Ques()
 	graph = integer.Concat(graph)
