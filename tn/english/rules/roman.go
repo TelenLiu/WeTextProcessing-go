@@ -113,7 +113,7 @@ func stringsToPairs(keys []string) [][]string {
 }
 
 func (r *Roman) BuildVerbalizer() {
-	ordinal := NewOrdinal(r.deterministic)
+	ordinal := getSharedOrdinal(r.deterministic)
 	suffix := ordinal.Suffix
 
 	cardinal := r.NOT_QUOTE.Star()

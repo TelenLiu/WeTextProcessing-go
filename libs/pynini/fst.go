@@ -4,8 +4,8 @@ import (
 	"container/heap"
 	"encoding/gob"
 	"os"
+	"sort"
 	"strings"
-	"sync"
 )
 
 // =============================================================================
@@ -83,12 +83,40 @@ type Fst struct {
 	Props   uint64
 
 	// Compose cache (lazily initialized, not serialized by gob)
-	epsArcIdx    [][]int          // epsArcIdx[s] = indices of epsilon arcs from state s (nil if none)
-	ilabelRanges []ilabelRangeMap // ilabelRanges[s] = precomputed ilabel mapping
-	composeReady bool
+	epsArcIdx      [][]int             // epsArcIdx[s] = indices of epsilon arcs from state s (nil if none)
+	epsFlat        [][]epsFlatArc      // epsFlat[s] = flattened epsilon arcs for direct iteration
+	ilabelRanges   []ilabelRangeMap    // ilabelRanges[s] = precomputed ilabel mapping
+	epsClosureList [][]epsClosureEntry // epsClosureList[s] = precomputed epsilon closure entries for state s
+	composeReady   bool
+	hasEpsArcs     bool // true if any state has epsilon arcs
 
 	// Rune label cache (lazily initialized, not serialized by gob)
 	runeLabelCache map[rune]int32
+
+	// Per-FST compose context and scratch (lazily initialized, not serialized by gob).
+	// Stored in the FST to avoid GC-triggered reallocation of large arrays.
+	composeCtx     *composeContext
+	composeScratch *composeScratch
+}
+
+// epsClosureEntry represents one step in the precomputed epsilon closure.
+// For state s, epsClosureList[s] contains entries for all states reachable
+// via input-epsilon arcs from s, in BFS order. Each entry records the
+// immediate predecessor and arc output label for backpointer reconstruction.
+type epsClosureEntry struct {
+	target    int32
+	from      int32   // immediate predecessor in epsilon chain
+	olabel    int32   // output label of arc from -> target
+	relWeight float32 // accumulated weight from source to this target
+}
+
+// epsFlatArc is a flattened representation of an input-epsilon arc,
+// storing (target, weight, olabel) directly to avoid indirection
+// through States[s].Arcs[epsArcIdx[s][i]] during epsilon closure BFS.
+type epsFlatArc struct {
+	next   int32
+	weight float32
+	olabel int32
 }
 
 // =============================================================================
@@ -255,20 +283,23 @@ func Cross(a, b interface{}) *Fst {
 			// Delete: copy the FST and set all OLabels to epsilon
 			return withOutputEpsilon(aFst)
 		}
-		// Cross(fst, non-empty str): use string representation
-		aStr := strFromFst(aFst)
-		return crossFromStrings(aStr, bStr)
+		// Build the cross by replacing all output labels in aFst with bStr characters
+		return crossFstToStr(aFst, bStr)
 	}
 
 	if bIsFst {
 		// Cross(str, fst): map input string to output labels of fst
+		// Create a transducer where input is aStr and output follows bFst's output paths
 		aStr := toString(a)
 		if aStr == "" {
 			// Insert: copy the FST and set all ILabels to epsilon
 			return withInputEpsilon(bFst)
 		}
-		bStr := strFromFst(bFst)
-		return crossFromStrings(aStr, bStr)
+		// Build the cross by replacing all input labels in bFst with aStr characters
+		// For each path through bFst, replace the input labels with the characters of aStr
+		// This is equivalent to: for each accepting path in bFst, create a parallel path
+		// where input is aStr and output is the path's output
+		return crossStrToFst(aStr, bFst)
 	}
 
 	// Both are strings (or neither is FST)
@@ -383,6 +414,127 @@ func crossFromStrings(aStr, bStr string) *Fst {
 	}
 	f.SetFinal(stateID-1, 0)
 	return f
+}
+
+// crossStrToFst creates a transducer where input is aStr and output follows
+// all output paths of bFst. For each accepting path in bFst, we create a
+// parallel path where the input is aStr (character by character, with epsilons
+// padding if aStr is shorter than the output path) and the output is the path's
+// output labels.
+func crossStrToFst(aStr string, bFst *Fst) *Fst {
+	if bFst == nil || len(bFst.States) == 0 {
+		return NewFst()
+	}
+	// Find all output strings from bFst via DFS
+	type pathEntry struct {
+		state  int32
+		output string
+	}
+	var outputStrings []string
+	visited := make(map[int32]bool)
+	var stack []pathEntry
+	stack = append(stack, pathEntry{state: bFst.Start, output: ""})
+
+	for len(stack) > 0 {
+		entry := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+
+		if int(entry.state) >= len(bFst.States) {
+			continue
+		}
+
+		if bFst.States[entry.state].Final {
+			outputStrings = append(outputStrings, entry.output)
+		}
+
+		for _, arc := range bFst.States[entry.state].Arcs {
+			if visited[arc.Next] && arc.ILabel == EpsilonLabel && arc.OLabel == EpsilonLabel {
+				continue
+			}
+			newOutput := entry.output
+			if arc.OLabel != EpsilonLabel {
+				newOutput += bFst.Symbols.Symbol(arc.OLabel)
+			}
+			stack = append(stack, pathEntry{state: arc.Next, output: newOutput})
+		}
+		visited[entry.state] = true
+	}
+
+	if len(outputStrings) == 0 {
+		return NewFst()
+	}
+
+	// Build the cross FST by union of crossFromStrings for each output string
+	var result *Fst
+	for _, outStr := range outputStrings {
+		cross := crossFromStrings(aStr, outStr)
+		if result == nil {
+			result = cross
+		} else {
+			result = Union(result, cross)
+		}
+	}
+	return result
+}
+
+// crossFstToStr creates a transducer where input follows all input paths of aFst
+// and output is bStr. For each accepting path in aFst, we create a parallel path
+// where the input is the path's input labels and the output is bStr.
+func crossFstToStr(aFst *Fst, bStr string) *Fst {
+	if aFst == nil || len(aFst.States) == 0 {
+		return NewFst()
+	}
+
+	// Find all input strings from aFst via DFS
+	type pathEntry struct {
+		state int32
+		input string
+	}
+	var inputStrings []string
+	visited := make(map[int32]bool)
+	var stack []pathEntry
+	stack = append(stack, pathEntry{state: aFst.Start, input: ""})
+
+	for len(stack) > 0 {
+		entry := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+
+		if int(entry.state) >= len(aFst.States) {
+			continue
+		}
+
+		if aFst.States[entry.state].Final {
+			inputStrings = append(inputStrings, entry.input)
+		}
+
+		for _, arc := range aFst.States[entry.state].Arcs {
+			if visited[arc.Next] && arc.ILabel == EpsilonLabel && arc.OLabel == EpsilonLabel {
+				continue
+			}
+			newInput := entry.input
+			if arc.ILabel != EpsilonLabel {
+				newInput += aFst.Symbols.Symbol(arc.ILabel)
+			}
+			stack = append(stack, pathEntry{state: arc.Next, input: newInput})
+		}
+		visited[entry.state] = true
+	}
+
+	if len(inputStrings) == 0 {
+		return NewFst()
+	}
+
+	// Build the cross FST by union of crossFromStrings for each input string
+	var result *Fst
+	for _, inStr := range inputStrings {
+		cross := crossFromStrings(inStr, bStr)
+		if result == nil {
+			result = cross
+		} else {
+			result = Union(result, cross)
+		}
+	}
+	return result
 }
 
 // CrossFst is a variant of Cross for FST operands.
@@ -1579,7 +1731,173 @@ func (f *Fst) PrepareForComposition() {
 		}
 	}
 
+	// Check if any state has epsilon arcs
+	for s := range f.States {
+		if len(f.epsArcIdx[s]) > 0 {
+			f.hasEpsArcs = true
+			break
+		}
+	}
+
+	// Build flattened epsilon arcs for direct iteration during BFS.
+	// This avoids the indirection through States[s].Arcs[epsArcIdx[s][i]].
+	if f.hasEpsArcs {
+		f.epsFlat = make([][]epsFlatArc, numStates)
+		for s := range f.States {
+			epsIdx := f.epsArcIdx[s]
+			if len(epsIdx) == 0 {
+				continue
+			}
+			flat := make([]epsFlatArc, len(epsIdx))
+			arcs := f.States[s].Arcs
+			for i, idx := range epsIdx {
+				arc := &arcs[idx]
+				flat[i] = epsFlatArc{
+					next:   arc.Next,
+					weight: arc.Weight,
+					olabel: arc.OLabel,
+				}
+			}
+			f.epsFlat[s] = flat
+		}
+	}
+
+	// Pre-compute epsilon closures for runtime BFS acceleration.
+	// For each state s, epsClosureList[s] contains entries for all states
+	// reachable via input-epsilon arcs from s, in BFS order.
+	// Only pre-compute for states with small closures (<= maxEpsClosureSize)
+	// to limit memory usage. States with large closures fall back to runtime BFS.
+	if f.hasEpsArcs {
+		const maxEpsClosureSize = 200 // limit per-state closure size
+		f.epsClosureList = make([][]epsClosureEntry, numStates)
+		// Reusable arrays for BFS (avoid allocation per state)
+		visited := make([]uint32, numStates) // generation-based visited
+		bestWeight := make([]float32, numStates)
+		var queue []int32
+		var gen uint32
+
+		for s := 0; s < numStates; s++ {
+			if len(f.epsArcIdx[s]) == 0 {
+				continue // no epsilon arcs from this state
+			}
+
+			// BFS from state s over input-epsilon arcs
+			gen++
+			queue = queue[:0]
+			queue = append(queue, int32(s))
+			visited[s] = gen
+			bestWeight[s] = 0
+			var entries []epsClosureEntry
+			tooLarge := false
+
+			for len(queue) > 0 {
+				cur := queue[0]
+				queue = queue[1:]
+				curW := bestWeight[cur]
+
+				for _, idx := range f.epsArcIdx[cur] {
+					arc := &f.States[cur].Arcs[idx]
+					nw := curW + arc.Weight
+					t := arc.Next
+					if visited[t] != gen || nw < bestWeight[t] {
+						bestWeight[t] = nw
+						entries = append(entries, epsClosureEntry{
+							target:    t,
+							from:      cur,
+							olabel:    arc.OLabel,
+							relWeight: nw,
+						})
+						if len(entries) > maxEpsClosureSize {
+							tooLarge = true
+							break
+						}
+						if visited[t] != gen {
+							visited[t] = gen
+							queue = append(queue, t)
+						}
+					}
+				}
+				if tooLarge {
+					break
+				}
+			}
+
+			if !tooLarge {
+				f.epsClosureList[s] = entries
+			}
+			// If tooLarge, epsClosureList[s] remains nil -> runtime BFS fallback
+		}
+	}
+
 	f.composeReady = true
+}
+
+// GetEpsArcIdxPublic returns the epsilon arc indices for a state (for debugging).
+func (f *Fst) GetEpsArcIdxPublic(s int) []int {
+	if s < 0 || s >= len(f.epsArcIdx) {
+		return nil
+	}
+	return f.epsArcIdx[s]
+}
+
+// EpsClosureStats holds statistics about the precomputed epsilon closure list.
+type EpsClosureStats struct {
+	TotalEntries      int
+	StatesWithClosure int
+	MinSize           int
+	MaxSize           int
+	AvgSize           float64
+	TopStates         []EpsClosureStateInfo // top states by closure size
+	MemoryEstimate    int64                 // estimated bytes (entries * 16)
+}
+
+// EpsClosureStateInfo holds info about a single state's epsilon closure.
+type EpsClosureStateInfo struct {
+	StateID     int
+	ClosureSize int
+}
+
+// GetEpsClosureStats computes and returns statistics about the epsilon closure list.
+func (f *Fst) GetEpsClosureStats() EpsClosureStats {
+	var stats EpsClosureStats
+	if len(f.epsClosureList) == 0 {
+		return stats
+	}
+
+	stats.MinSize = -1 // sentinel: not yet set
+	for s, entries := range f.epsClosureList {
+		n := len(entries)
+		stats.TotalEntries += n
+		if n > 0 {
+			stats.StatesWithClosure++
+			if stats.MinSize < 0 || n < stats.MinSize {
+				stats.MinSize = n
+			}
+			if n > stats.MaxSize {
+				stats.MaxSize = n
+			}
+			stats.TopStates = append(stats.TopStates, EpsClosureStateInfo{
+				StateID:     s,
+				ClosureSize: n,
+			})
+		}
+	}
+	if stats.StatesWithClosure > 0 {
+		stats.AvgSize = float64(stats.TotalEntries) / float64(stats.StatesWithClosure)
+	} else {
+		stats.MinSize = 0
+	}
+	stats.MemoryEstimate = int64(stats.TotalEntries) * 16
+
+	// Sort top states by closure size descending, keep top 10
+	sort.Slice(stats.TopStates, func(i, j int) bool {
+		return stats.TopStates[i].ClosureSize > stats.TopStates[j].ClosureSize
+	})
+	if len(stats.TopStates) > 10 {
+		stats.TopStates = stats.TopStates[:10]
+	}
+
+	return stats
 }
 
 // =============================================================================
@@ -1587,14 +1905,7 @@ func (f *Fst) PrepareForComposition() {
 // =============================================================================
 
 // ComposeInputWithFst composes input with the FST and returns the shortest output.
-// Uses on-the-fly composition with int label matching.
-// Optimized with:
-//   - Precomputed epsilon arc indices (no linear scan)
-//   - Precomputed ilabel range maps (binary search)
-//   - Dense weight arrays with generation counters (fast epsilon closure)
-//   - Active state lists maintained through epsilon closure (no full scan)
-//   - Rune label cache (avoids string(r) allocation per character)
-//   - sync.Pool for scratch array reuse
+// Uses on-the-fly composition with dense arrays + generation counters.
 func ComposeInputWithFst(inputStr string, f *Fst, other *Fst) string {
 	if other == nil {
 		return ""
@@ -1615,90 +1926,102 @@ func ComposeInputWithFst(inputStr string, f *Fst, other *Fst) string {
 		return ""
 	}
 
-	// Ensure compose cache is ready
 	other.PrepareForComposition()
 
-	// Pre-compute input label IDs for each rune position using rune cache.
 	inputLabels := make([]int32, numRunes)
 	for i, r := range runes {
 		inputLabels[i] = other.FindRuneLabel(r)
 	}
 
-	// Dense weight arrays with generation counters.
-	// Pooled to avoid per-call allocation of large arrays.
-	scratch := getComposeScratch(numStates)
-	defer putComposeScratch(scratch)
+	scratch := other.getOrCreateComposeScratch(numStates)
 	curWeight := scratch.curWeight
 	curGen := scratch.curGen
 	nextWeight := scratch.nextWeight
 	nextGen := scratch.nextGen
 
-	// Get pooled compose context (posStates maps, active slices)
-	ctx := getComposeContext(numRunes + 1)
-	defer putComposeContext(ctx)
-	posStates := ctx.posStates
+	numPositions := numRunes + 1
+	ctx := other.getOrCreateComposeContext(numPositions, numStates)
 
 	// Initialize start state
-	posStates[0][other.Start] = composeStateEntry{
-		weight: 0,
-		bp:     composeBP{fromPos: -1, fromState: -1, olabel: EpsilonLabel},
-	}
+	ctx.ctxSet(0, other.Start, 0, -1, -1, EpsilonLabel)
+	curWeight[other.Start] = 0
+	curGen[other.Start] = scratch.callGen + 1
 
-	var gen uint32 = 1
+	var gen uint32 = scratch.callGen + 1
 
-	// Active states at current position — maintained through epsilon closure
 	curActive := ctx.curActive
 	curActive = append(curActive, other.Start)
-
-	// Epsilon closure queue
+	nextActive := ctx.nextActive
 	epsQueue := ctx.epsQueue
 
 	for pos := 0; pos <= numRunes; pos++ {
-		// Initialize dense arrays from posStates for fast epsilon closure
-		curMap := posStates[pos]
-		for s, entry := range curMap {
-			curWeight[s] = entry.weight
-			curGen[s] = gen
-		}
-
-		// Epsilon closure: follow all epsilon arcs at this position.
-		// New states discovered via epsilon are added to curActive.
-		epsQueue = epsQueue[:0]
-		epsQueue = append(epsQueue, curActive...)
-		epsHead := 0
-		for epsHead < len(epsQueue) {
-			s := epsQueue[epsHead]
-			epsHead++
-			if int(s) >= numStates {
-				continue
-			}
-			curW := curWeight[s]
-			epsIdx := other.epsArcIdx[s]
-			if epsIdx == nil {
-				continue
-			}
-			arcs := other.States[s].Arcs
-			for _, idx := range epsIdx {
-				arc := &arcs[idx]
-				nw := curW + arc.Weight
-				t := arc.Next
-				if int(t) >= numStates {
-					continue
-				}
-				if curGen[t] != gen || nw < curWeight[t] {
-					curWeight[t] = nw
-					wasNew := curGen[t] != gen
-					curGen[t] = gen
-					epsQueue = append(epsQueue, t)
-					if wasNew {
-						curActive = append(curActive, t)
+		// Epsilon closure (only if FST has epsilon arcs)
+		// Optimization: use pre-computed epsilon closure when there is exactly
+		// one active state (the start state at position 0).
+		if other.hasEpsArcs {
+			intP := int32(pos)
+			usePrecomputed := len(curActive) == 1 && pos == 0 && other.epsClosureList[curActive[0]] != nil
+			if usePrecomputed {
+				s := curActive[0]
+				entries := other.epsClosureList[s]
+				startW := curWeight[s]
+				for i := range entries {
+					entry := &entries[i]
+					t := entry.target
+					nw := startW + entry.relWeight
+					if curGen[t] != gen || nw < curWeight[t] {
+						wasNew := curGen[t] != gen
+						curWeight[t] = nw
+						curGen[t] = gen
+						if wasNew {
+							curActive = append(curActive, t)
+						}
+						ctx.ctxSet(intP, t, nw, intP, entry.from, entry.olabel)
 					}
-					curMap[t] = composeStateEntry{weight: nw, bp: composeBP{fromPos: int32(pos), fromState: s, olabel: arc.OLabel}}
+				}
+			} else {
+				epsQueue = epsQueue[:0]
+				for i := 0; i < len(curActive); i++ {
+					s := curActive[i]
+					if int(s) < numStates && len(other.epsFlat[s]) > 0 {
+						epsQueue = append(epsQueue, s)
+					}
+				}
+				epsHead := 0
+				for epsHead < len(epsQueue) {
+					s := epsQueue[epsHead]
+					epsHead++
+					if int(s) >= numStates {
+						continue
+					}
+					curW := curWeight[s]
+					epsFlat := other.epsFlat[s]
+					if len(epsFlat) == 0 {
+						continue
+					}
+					for i := range epsFlat {
+						e := &epsFlat[i]
+						nw := curW + e.weight
+						t := e.next
+						if int(t) >= numStates {
+							continue
+						}
+						if curGen[t] != gen || nw < curWeight[t] {
+							curWeight[t] = nw
+							wasNew := curGen[t] != gen
+							curGen[t] = gen
+							epsQueue = append(epsQueue, t)
+							if wasNew {
+								curActive = append(curActive, t)
+							}
+							ctx.ctxSet(intP, t, nw, intP, s, e.olabel)
+						}
+					}
 				}
 			}
 		}
 
-		// Character matching: advance to next position.
+		// Character matching
 		if pos < numRunes {
 			matchLabel := inputLabels[pos]
 			if matchLabel < 0 {
@@ -1708,19 +2031,17 @@ func ComposeInputWithFst(inputStr string, f *Fst, other *Fst) string {
 			}
 			gen++
 			nextGen2 := gen
-			nextMap := posStates[pos+1]
+			nextActive = nextActive[:0]
 
 			for _, s := range curActive {
 				if int(s) >= numStates {
 					continue
 				}
 				curW := curWeight[s]
-				// Use precomputed ilabel range map for O(log n) lookup
 				irm := &other.ilabelRanges[s]
 				if len(irm.labels) == 0 {
 					continue
 				}
-				// Binary search on precomputed labels
 				lo, hi := 0, len(irm.labels)
 				for lo < hi {
 					mid := lo + (hi-lo)/2
@@ -1733,7 +2054,6 @@ func ComposeInputWithFst(inputStr string, f *Fst, other *Fst) string {
 				if lo >= len(irm.labels) || irm.labels[lo] != matchLabel {
 					continue
 				}
-				// Iterate over all arcs with this ilabel
 				arcs := other.States[s].Arcs
 				start := irm.starts[lo]
 				end := start + irm.counts[lo]
@@ -1745,28 +2065,34 @@ func ComposeInputWithFst(inputStr string, f *Fst, other *Fst) string {
 						continue
 					}
 					if nextGen[t] != nextGen2 || nw < nextWeight[t] {
+						isNew := nextGen[t] != nextGen2
 						nextWeight[t] = nw
 						nextGen[t] = nextGen2
-						nextMap[t] = composeStateEntry{weight: nw, bp: composeBP{fromPos: int32(pos), fromState: s, olabel: arc.OLabel}}
+						if isNew {
+							nextActive = append(nextActive, t)
+						}
+						ctx.ctxSet(int32(pos+1), t, nw, int32(pos), s, arc.OLabel)
 					}
 				}
 			}
 
-			// Prepare next active states
-			curActive = curActive[:0]
-			for s := range nextMap {
-				curActive = append(curActive, s)
+			// Swap: nextActive becomes curActive for the next position
+			curActive, nextActive = nextActive, curActive[:0]
+
+			// Copy weights from nextWeight to curWeight for next iteration
+			for _, s := range curActive {
+				curWeight[s] = nextWeight[s]
+				curGen[s] = gen
 			}
 		}
 	}
 
-	// Find best final state at the end position.
+	// Find best final state at the end position
 	minWeight := float32(1e30)
 	bestEndState := int32(-1)
-
-	for s, entry := range posStates[numRunes] {
+	for _, s := range curActive {
 		if int(s) < numStates && other.States[s].Final {
-			totalW := entry.weight + other.States[s].Weight
+			totalW := curWeight[s] + other.States[s].Weight
 			if totalW < minWeight {
 				minWeight = totalW
 				bestEndState = s
@@ -1778,23 +2104,22 @@ func ComposeInputWithFst(inputStr string, f *Fst, other *Fst) string {
 		return ""
 	}
 
-	// Reconstruct output by following backpointers from the best final state.
+	// Reconstruct output
 	var olabels []int32
 	curState := bestEndState
 	curPos := int32(numRunes)
 	for {
-		entry, ok := posStates[curPos][curState]
-		if !ok || entry.bp.fromPos < 0 {
+		_, fromPos, fromState, olabel, ok := ctx.ctxGet(curPos, curState)
+		if !ok || fromPos < 0 {
 			break
 		}
-		if entry.bp.olabel != EpsilonLabel {
-			olabels = append(olabels, entry.bp.olabel)
+		if olabel != EpsilonLabel {
+			olabels = append(olabels, olabel)
 		}
-		curState = entry.bp.fromState
-		curPos = entry.bp.fromPos
+		curState = fromState
+		curPos = fromPos
 	}
 
-	// Reverse and build output string
 	if len(olabels) == 0 {
 		return ""
 	}
@@ -1818,11 +2143,7 @@ type ComposePrefixResult struct {
 // ComposePrefixShortestPath composes the input string with the FST and finds
 // the best match that consumes a prefix of the input. Returns the output,
 // the number of input characters consumed, and the weight.
-// Optimized with:
-//   - Precomputed epsilon arc indices and ilabel range maps
-//   - Reusable scratch weight arrays (no per-call allocation)
-//   - Active state lists maintained through epsilon closure (no full scan)
-//   - Rune label cache (avoids string(r) allocation per character)
+// Optimized with dense arrays + generation counters (no map overhead).
 func ComposePrefixShortestPath(inputStr string, other *Fst) ComposePrefixResult {
 	if other == nil || inputStr == "" {
 		return ComposePrefixResult{}
@@ -1845,88 +2166,76 @@ func ComposePrefixShortestPath(inputStr string, other *Fst) ComposePrefixResult 
 	}
 
 	// Dense weight arrays with generation counters for epsilon closure
-	// Pooled to avoid per-call allocation of large arrays.
-	scratch := getComposeScratch(numStates)
-	defer putComposeScratch(scratch)
+	scratch := other.getOrCreateComposeScratch(numStates)
 	curWeight := scratch.curWeight
 	curGen := scratch.curGen
 	nextWeight := scratch.nextWeight
 	nextGen := scratch.nextGen
 
-	var gen uint32 = 1
+	var gen uint32 = scratch.callGen + 1
 
-	// Get pooled compose context (posStates maps, active slices)
-	ctx := getComposeContext(numRunes + 1)
-	defer putComposeContext(ctx)
-	posStates := ctx.posStates
+	// Get compose context from FST cache (dense arrays + active lists)
+	numPositions := numRunes + 1
+	ctx := other.getOrCreateComposeContext(numPositions, numStates)
 
 	// Initialize start state
-	posStates[0][other.Start] = composeStateEntry{
-		weight: 0,
-		bp:     composeBP{fromPos: -1, fromState: -1, olabel: EpsilonLabel},
-	}
+	ctx.ctxSet(0, other.Start, 0, -1, -1, EpsilonLabel)
+	curWeight[other.Start] = 0
+	curGen[other.Start] = gen
 
-	// Active states at current position
 	curActive := ctx.curActive
 	curActive = append(curActive, other.Start)
+	nextActive := ctx.nextActive
+	epsQueue := ctx.epsQueue
 
 	// Track the best final match at each position
 	bestConsumed := 0
 	bestEndState := int32(-1)
 	bestWeight := float32(1e30)
 
-	epsQueue := ctx.epsQueue
-
 	for pos := 0; pos <= numRunes; pos++ {
-		// Initialize dense arrays from posStates
-		curMap := posStates[pos]
-		for s, entry := range curMap {
-			curWeight[s] = entry.weight
-			curGen[s] = gen
-		}
-
-		// Epsilon closure
-		epsQueue = epsQueue[:0]
-		epsQueue = append(epsQueue, curActive...)
-		epsHead := 0
-		for epsHead < len(epsQueue) {
-			s := epsQueue[epsHead]
-			epsHead++
-			if int(s) >= numStates {
-				continue
-			}
-			curW := curWeight[s]
-			epsIdx := other.epsArcIdx[s]
-			if epsIdx == nil {
-				continue
-			}
-			arcs := other.States[s].Arcs
-			for _, idx := range epsIdx {
-				arc := &arcs[idx]
-				nw := curW + arc.Weight
-				t := arc.Next
-				if int(t) >= numStates {
+		// Epsilon closure (only if FST has epsilon arcs)
+		if other.hasEpsArcs {
+			epsQueue = epsQueue[:0]
+			epsQueue = append(epsQueue, curActive...)
+			epsHead := 0
+			for epsHead < len(epsQueue) {
+				s := epsQueue[epsHead]
+				epsHead++
+				if int(s) >= numStates {
 					continue
 				}
-				if curGen[t] != gen || nw < curWeight[t] {
-					curWeight[t] = nw
-					wasNew := curGen[t] != gen
-					curGen[t] = gen
-					epsQueue = append(epsQueue, t)
-					if wasNew {
-						curActive = append(curActive, t)
+				curW := curWeight[s]
+				epsIdx := other.epsArcIdx[s]
+				if epsIdx == nil {
+					continue
+				}
+				arcs := other.States[s].Arcs
+				for _, idx := range epsIdx {
+					arc := &arcs[idx]
+					nw := curW + arc.Weight
+					t := arc.Next
+					if int(t) >= numStates {
+						continue
 					}
-					newBP := composeBP{fromPos: int32(pos), fromState: s, olabel: arc.OLabel}
-					curMap[t] = composeStateEntry{weight: nw, bp: newBP}
+					if curGen[t] != gen || nw < curWeight[t] {
+						curWeight[t] = nw
+						wasNew := curGen[t] != gen
+						curGen[t] = gen
+						epsQueue = append(epsQueue, t)
+						if wasNew {
+							curActive = append(curActive, t)
+						}
+						ctx.ctxSet(int32(pos), t, nw, int32(pos), s, arc.OLabel)
+					}
 				}
 			}
 		}
 
-		// Check for final states at this position
+		// Check for final states at this position (after epsilon closure)
 		for _, s := range curActive {
 			if int(s) < numStates && other.States[s].Final {
-				entry := curMap[s]
-				totalW := entry.weight + other.States[s].Weight
+				totalW := curWeight[s] + other.States[s].Weight
 				if pos > bestConsumed || (pos == bestConsumed && totalW < bestWeight) {
 					bestWeight = totalW
 					bestConsumed = pos
@@ -1935,6 +2244,7 @@ func ComposePrefixShortestPath(inputStr string, other *Fst) ComposePrefixResult 
 			}
 		}
 
+		// Character matching
 		if pos < numRunes {
 			matchLabel := inputLabels[pos]
 			if matchLabel < 0 {
@@ -1944,7 +2254,7 @@ func ComposePrefixShortestPath(inputStr string, other *Fst) ComposePrefixResult 
 			}
 			gen++
 			nextGen2 := gen
-			nextMap := posStates[pos+1]
+			nextActive = nextActive[:0]
 
 			for _, s := range curActive {
 				if int(s) >= numStates {
@@ -1978,18 +2288,24 @@ func ComposePrefixShortestPath(inputStr string, other *Fst) ComposePrefixResult 
 						continue
 					}
 					if nextGen[t] != nextGen2 || nw < nextWeight[t] {
+						isNew := nextGen[t] != nextGen2
 						nextWeight[t] = nw
 						nextGen[t] = nextGen2
-						newBP := composeBP{fromPos: int32(pos), fromState: s, olabel: arc.OLabel}
-						nextMap[t] = composeStateEntry{weight: nw, bp: newBP}
+						if isNew {
+							nextActive = append(nextActive, t)
+						}
+						ctx.ctxSet(int32(pos+1), t, nw, int32(pos), s, arc.OLabel)
 					}
 				}
 			}
 
-			// Prepare next active states
-			curActive = curActive[:0]
-			for s := range nextMap {
-				curActive = append(curActive, s)
+			// Swap: nextActive becomes curActive for the next position
+			curActive, nextActive = nextActive, curActive[:0]
+
+			// Copy weights from nextWeight to curWeight for next iteration
+			for _, s := range curActive {
+				curWeight[s] = nextWeight[s]
+				curGen[s] = gen
 			}
 		}
 	}
@@ -2003,15 +2319,283 @@ func ComposePrefixShortestPath(inputStr string, other *Fst) ComposePrefixResult 
 	curState := bestEndState
 	curPos := int32(bestConsumed)
 	for {
-		entry, ok := posStates[curPos][curState]
-		if !ok || entry.bp.fromPos < 0 {
+		_, fromPos, fromState, olabel, ok := ctx.ctxGet(curPos, curState)
+		if !ok || fromPos < 0 {
 			break
 		}
-		if entry.bp.olabel != EpsilonLabel {
-			olabels = append(olabels, entry.bp.olabel)
+		if olabel != EpsilonLabel {
+			olabels = append(olabels, olabel)
 		}
-		curState = entry.bp.fromState
-		curPos = entry.bp.fromPos
+		curState = fromState
+		curPos = fromPos
+	}
+
+	var output string
+	if len(olabels) > 0 {
+		for i, j := 0, len(olabels)-1; i < j; i, j = i+1, j-1 {
+			olabels[i], olabels[j] = olabels[j], olabels[i]
+		}
+		var sb strings.Builder
+		for _, l := range olabels {
+			sb.WriteString(other.Symbols.Symbol(l))
+		}
+		output = sb.String()
+	}
+
+	return ComposePrefixResult{
+		Output:   output,
+		Consumed: bestConsumed,
+		Weight:   bestWeight,
+	}
+}
+
+// ComposePrefixShortestPathRunes composes input runes with the FST and finds
+// the best match that consumes a prefix of the input. This version accepts a
+// rune slice directly, avoiding string allocation and conversion overhead.
+// The pos parameter specifies the starting position in the runes slice,
+// and maxLen limits the number of runes to consider from pos.
+// Optimized with dense arrays + generation counters (no map overhead).
+func ComposePrefixShortestPathRunes(runes []rune, pos int, maxLen int, other *Fst) ComposePrefixResult {
+	if other == nil || len(runes) == 0 || pos >= len(runes) {
+		return ComposePrefixResult{}
+	}
+
+	effectiveLen := len(runes) - pos
+	if maxLen > 0 && maxLen < effectiveLen {
+		effectiveLen = maxLen
+	}
+	if effectiveLen <= 0 {
+		return ComposePrefixResult{}
+	}
+
+	// Pre-compute input label IDs
+	inputLabels := make([]int32, effectiveLen)
+	for i := 0; i < effectiveLen; i++ {
+		inputLabels[i] = other.FindRuneLabel(runes[pos+i])
+	}
+	return composePrefixShortestPathCore(inputLabels, effectiveLen, other)
+}
+
+// ComposePrefixShortestPathRunesWithLabels is like ComposePrefixShortestPathRunes
+// but accepts pre-computed input label IDs. This avoids redundant label computation
+// when composing the same input against multiple FSTs.
+func ComposePrefixShortestPathRunesWithLabels(inputLabels []int32, effectiveLen int, other *Fst) ComposePrefixResult {
+	if other == nil || len(inputLabels) == 0 || effectiveLen <= 0 {
+		return ComposePrefixResult{}
+	}
+	if effectiveLen > len(inputLabels) {
+		effectiveLen = len(inputLabels)
+	}
+	return composePrefixShortestPathCore(inputLabels, effectiveLen, other)
+}
+
+// composePrefixShortestPathCore is the shared core of ComposePrefixShortestPath*
+// functions. It composes pre-computed input labels with the FST and finds the
+// best match prefix using dense arrays + generation counters.
+func composePrefixShortestPathCore(inputLabels []int32, effectiveLen int, other *Fst) ComposePrefixResult {
+	numStates := len(other.States)
+	if numStates == 0 {
+		return ComposePrefixResult{}
+	}
+
+	// Ensure compose cache is ready
+	other.PrepareForComposition()
+
+	// Dense weight arrays with generation counters for epsilon closure
+	scratch := other.getOrCreateComposeScratch(numStates)
+	curWeight := scratch.curWeight
+	curGen := scratch.curGen
+	nextWeight := scratch.nextWeight
+	nextGen := scratch.nextGen
+
+	var gen uint32 = scratch.callGen + 1
+
+	// Get compose context from FST cache (dense arrays + active lists)
+	numPositions := effectiveLen + 1
+	ctx := other.getOrCreateComposeContext(numPositions, numStates)
+
+	// Initialize start state
+	ctx.ctxSet(0, other.Start, 0, -1, -1, EpsilonLabel)
+	curWeight[other.Start] = 0
+	curGen[other.Start] = gen
+
+	curActive := ctx.curActive
+	curActive = append(curActive, other.Start)
+	nextActive := ctx.nextActive
+
+	bestConsumed := 0
+	bestEndState := int32(-1)
+	bestWeight := float32(1e30)
+
+	for p := 0; p <= effectiveLen; p++ {
+		// Epsilon closure via BFS.
+		// Optimization: use pre-computed epsilon closure when there is exactly
+		// one active state (the start state at position 0). This avoids the
+		// expensive BFS over the entire epsilon closure of the start state.
+		if other.hasEpsArcs {
+			intP := int32(p)
+			usePrecomputed := len(curActive) == 1 && p == 0 && other.epsClosureList[curActive[0]] != nil
+			if usePrecomputed {
+				s := curActive[0]
+				entries := other.epsClosureList[s]
+				startW := curWeight[s]
+				for i := range entries {
+					entry := &entries[i]
+					t := entry.target
+					nw := startW + entry.relWeight
+					if curGen[t] != gen || nw < curWeight[t] {
+						wasNew := curGen[t] != gen
+						curWeight[t] = nw
+						curGen[t] = gen
+						if wasNew {
+							curActive = append(curActive, t)
+						}
+						ctx.ctxSet(intP, t, nw, intP, entry.from, entry.olabel)
+					}
+				}
+			} else {
+				epsQueue := ctx.epsQueue
+				epsQueue = epsQueue[:0]
+				for i := 0; i < len(curActive); i++ {
+					s := curActive[i]
+					if int(s) < numStates && len(other.epsFlat[s]) > 0 {
+						epsQueue = append(epsQueue, s)
+					}
+				}
+				epsHead := 0
+				for epsHead < len(epsQueue) {
+					s := epsQueue[epsHead]
+					epsHead++
+					if int(s) >= numStates {
+						continue
+					}
+					curW := curWeight[s]
+					epsFlat := other.epsFlat[s]
+					if len(epsFlat) == 0 {
+						continue
+					}
+					for i := range epsFlat {
+						e := &epsFlat[i]
+						nw := curW + e.weight
+						t := e.next
+						if int(t) >= numStates {
+							continue
+						}
+						if curGen[t] != gen || nw < curWeight[t] {
+							curWeight[t] = nw
+							wasNew := curGen[t] != gen
+							curGen[t] = gen
+							epsQueue = append(epsQueue, t)
+							if wasNew {
+								curActive = append(curActive, t)
+							}
+							ctx.ctxSet(intP, t, nw, intP, s, e.olabel)
+						}
+					}
+				}
+			}
+		}
+
+		// Check for final states at this position
+		for _, s := range curActive {
+			if int(s) < numStates && other.States[s].Final {
+				totalW := curWeight[s] + other.States[s].Weight
+				if p > bestConsumed || (p == bestConsumed && totalW < bestWeight) {
+					bestWeight = totalW
+					bestConsumed = p
+					bestEndState = s
+				}
+			}
+		}
+
+		// Character matching
+		if p < effectiveLen {
+			// Early termination: if no active states, no further matches possible
+			if len(curActive) == 0 {
+				break
+			}
+			matchLabel := inputLabels[p]
+			if matchLabel < 0 {
+				gen++
+				curActive = curActive[:0]
+				continue
+			}
+			gen++
+			nextGen2 := gen
+			nextActive = nextActive[:0]
+
+			for _, s := range curActive {
+				if int(s) >= numStates {
+					continue
+				}
+				curW := curWeight[s]
+				irm := &other.ilabelRanges[s]
+				if len(irm.labels) == 0 {
+					continue
+				}
+				lo, hi := 0, len(irm.labels)
+				for lo < hi {
+					mid := lo + (hi-lo)/2
+					if irm.labels[mid] < matchLabel {
+						lo = mid + 1
+					} else {
+						hi = mid
+					}
+				}
+				if lo >= len(irm.labels) || irm.labels[lo] != matchLabel {
+					continue
+				}
+				arcs := other.States[s].Arcs
+				start := irm.starts[lo]
+				end := start + irm.counts[lo]
+				for i := start; i < end; i++ {
+					arc := &arcs[i]
+					nw := curW + arc.Weight
+					t := arc.Next
+					if int(t) >= numStates {
+						continue
+					}
+					if nextGen[t] != nextGen2 || nw < nextWeight[t] {
+						isNew := nextGen[t] != nextGen2
+						nextWeight[t] = nw
+						nextGen[t] = nextGen2
+						if isNew {
+							nextActive = append(nextActive, t)
+						}
+						ctx.ctxSet(int32(p+1), t, nw, int32(p), s, arc.OLabel)
+					}
+				}
+			}
+
+			// Swap: nextActive becomes curActive for the next position
+			curActive, nextActive = nextActive, curActive[:0]
+
+			// Copy weights from nextWeight to curWeight for next iteration
+			for _, s := range curActive {
+				curWeight[s] = nextWeight[s]
+				curGen[s] = gen
+			}
+		}
+	}
+
+	if bestEndState < 0 || bestConsumed == 0 {
+		return ComposePrefixResult{}
+	}
+
+	// Reconstruct output
+	var olabels []int32
+	curState := bestEndState
+	curPos := int32(bestConsumed)
+	for {
+		_, fromPos, fromState, olabel, ok := ctx.ctxGet(curPos, curState)
+		if !ok || fromPos < 0 {
+			break
+		}
+		if olabel != EpsilonLabel {
+			olabels = append(olabels, olabel)
+		}
+		curState = fromState
+		curPos = fromPos
 	}
 
 	var output string
@@ -2107,137 +2691,115 @@ func extractLinearInput(f *Fst) string {
 // Gob encoding registration
 // =============================================================================
 
-// composeBP stores backpointer information for path reconstruction.
-type composeBP struct {
-	fromPos   int32
-	fromState int32
-	olabel    int32
-}
-
-// composeStateEntry stores weight and backpointer for a state at a position.
-type composeStateEntry struct {
-	weight float32
-	bp     composeBP
-}
-
-// composeContext holds reusable per-call state for composition operations.
-// Pooled via sync.Pool to avoid massive per-call allocation of posStates maps.
+// composeContext holds reusable arrays for composition operations.
+// Uses dense 2D arrays with generation counters for backpointers.
+// Arrays are pooled and reused across calls to avoid allocation overhead.
 type composeContext struct {
-	posStates  []map[int32]composeStateEntry
+	stride      int      // numStates, for computing flat index: pos*stride+state
+	bpFromPos   []int32  // [pos*stride+state] = source position
+	bpFromState []int32  // [pos*stride+state] = source state
+	bpOLabel    []int32  // [pos*stride+state] = output label
+	posGen      []uint32 // [pos*stride+state] = generation counter
+	curGen      uint32   // current generation (incremented per call)
+
 	curActive  []int32
-	epsQueue   []int32
 	nextActive []int32
+	epsQueue   []int32
 }
 
-var composeContextPool = sync.Pool{
-	New: func() interface{} {
-		return &composeContext{}
-	},
-}
-
-// maxMapReuseCap is the maximum number of entries a reused map may have
-// before we discard it and allocate a fresh smaller one.
-const maxMapReuseCap = 128
-
-// getComposeContext returns a composeContext from the pool, ensuring it has
-// enough posStates maps for numPositions positions. Existing maps are cleared
-// (entries deleted) rather than reallocated.
-func getComposeContext(numPositions int) *composeContext {
-	ctx := composeContextPool.Get().(*composeContext)
-
-	// Ensure posStates slice is long enough
-	if len(ctx.posStates) < numPositions {
-		// Extend the slice
-		oldLen := len(ctx.posStates)
-		ctx.posStates = append(ctx.posStates, make([]map[int32]composeStateEntry, numPositions-oldLen)...)
+// getOrCreateComposeScratch returns a composeScratch for this FST, reusing cached
+// memory to avoid GC-triggered allocation. The scratch is stored in the FST and
+// reused across calls.
+func (f *Fst) getOrCreateComposeScratch(numStates int) *composeScratch {
+	if f.composeScratch == nil {
+		f.composeScratch = &composeScratch{}
 	}
-	posStates := ctx.posStates[:numPositions]
-
-	// Clear each map: delete all entries, or replace if too large
-	for i := range posStates {
-		m := posStates[i]
-		if m == nil {
-			if i == 0 {
-				m = make(map[int32]composeStateEntry, 16)
-			} else {
-				m = make(map[int32]composeStateEntry, 8)
-			}
-			posStates[i] = m
-		} else if len(m) > 0 {
-			if len(m) > maxMapReuseCap {
-				// Map grew too large; replace with a fresh smaller one
-				if i == 0 {
-					posStates[i] = make(map[int32]composeStateEntry, 16)
-				} else {
-					posStates[i] = make(map[int32]composeStateEntry, 8)
-				}
-			} else {
-				// Clear by deleting all entries (cheaper than reallocating)
-				for k := range m {
-					delete(m, k)
-				}
-			}
-		}
-	}
-
-	// Reset slices (keep capacity)
-	ctx.curActive = ctx.curActive[:0]
-	ctx.epsQueue = ctx.epsQueue[:0]
-	if ctx.nextActive == nil {
-		ctx.nextActive = make([]int32, 0, 128)
-	} else {
-		ctx.nextActive = ctx.nextActive[:0]
-	}
-
-	return ctx
-}
-
-func putComposeContext(ctx *composeContext) {
-	composeContextPool.Put(ctx)
-}
-
-// composeScratch holds reusable arrays for composition operations.
-// Pooled via sync.Pool to avoid per-call allocation of large arrays.
-type composeScratch struct {
-	curWeight  []float32
-	curGen     []uint32
-	nextWeight []float32
-	nextGen    []uint32
-}
-
-var composeScratchPool = sync.Pool{
-	New: func() interface{} {
-		return &composeScratch{}
-	},
-}
-
-func getComposeScratch(numStates int) *composeScratch {
-	s := composeScratchPool.Get().(*composeScratch)
-	// Ensure arrays are large enough (grow if needed, but don't shrink)
+	s := f.composeScratch
 	if cap(s.curWeight) < numStates {
 		s.curWeight = make([]float32, numStates)
 		s.curGen = make([]uint32, numStates)
 		s.nextWeight = make([]float32, numStates)
 		s.nextGen = make([]uint32, numStates)
 	} else {
-		// Reuse existing capacity — just set length
 		s.curWeight = s.curWeight[:numStates]
 		s.curGen = s.curGen[:numStates]
 		s.nextWeight = s.nextWeight[:numStates]
 		s.nextGen = s.nextGen[:numStates]
-		// Zero the gen arrays to avoid stale generation matches
-		for i := range s.curGen {
-			s.curGen[i] = 0
-		}
-		for i := range s.nextGen {
-			s.nextGen[i] = 0
-		}
 	}
+	s.callGen += 1000
 	return s
 }
 
-func putComposeScratch(s *composeScratch) {
-	composeScratchPool.Put(s)
+// getOrCreateComposeContext returns a composeContext for this FST, reusing cached
+// memory to avoid GC-triggered allocation.
+func (f *Fst) getOrCreateComposeContext(numPositions, numStates int) *composeContext {
+	if f.composeCtx == nil {
+		f.composeCtx = &composeContext{}
+	}
+	ctx := f.composeCtx
+	ctx.curGen++
+	if ctx.curGen == 0 {
+		ctx.curGen = 1
+	}
+
+	totalSize := numPositions * numStates
+	ctx.stride = numStates
+
+	if cap(ctx.bpFromPos) < totalSize {
+		ctx.bpFromPos = make([]int32, totalSize)
+		ctx.bpFromState = make([]int32, totalSize)
+		ctx.bpOLabel = make([]int32, totalSize)
+		ctx.posGen = make([]uint32, totalSize)
+	} else {
+		ctx.bpFromPos = ctx.bpFromPos[:totalSize]
+		ctx.bpFromState = ctx.bpFromState[:totalSize]
+		ctx.bpOLabel = ctx.bpOLabel[:totalSize]
+		ctx.posGen = ctx.posGen[:totalSize]
+	}
+
+	if cap(ctx.curActive) < numStates {
+		ctx.curActive = make([]int32, 0, numStates)
+	} else {
+		ctx.curActive = ctx.curActive[:0]
+	}
+	if cap(ctx.nextActive) < numStates {
+		ctx.nextActive = make([]int32, 0, numStates)
+	} else {
+		ctx.nextActive = ctx.nextActive[:0]
+	}
+	if cap(ctx.epsQueue) < numStates*2 {
+		ctx.epsQueue = make([]int32, 0, numStates*2)
+	} else {
+		ctx.epsQueue = ctx.epsQueue[:0]
+	}
+
+	return ctx
+}
+
+func (ctx *composeContext) ctxSet(pos, state int32, weight float32, fromPos, fromState, olabel int32) {
+	idx := int(pos)*ctx.stride + int(state)
+	ctx.bpFromPos[idx] = fromPos
+	ctx.bpFromState[idx] = fromState
+	ctx.bpOLabel[idx] = olabel
+	ctx.posGen[idx] = ctx.curGen
+}
+
+func (ctx *composeContext) ctxGet(pos, state int32) (float32, int32, int32, int32, bool) {
+	idx := int(pos)*ctx.stride + int(state)
+	if ctx.posGen[idx] != ctx.curGen {
+		return 0, 0, 0, 0, false
+	}
+	return 0, ctx.bpFromPos[idx], ctx.bpFromState[idx], ctx.bpOLabel[idx], true
+}
+
+// composeScratch holds reusable arrays for composition operations.
+// Stored in the FST to avoid GC-triggered reallocation of large arrays.
+type composeScratch struct {
+	curWeight  []float32
+	curGen     []uint32
+	nextWeight []float32
+	nextGen    []uint32
+	callGen    uint32 // per-instance generation base, incremented each call
 }
 
 func init() {

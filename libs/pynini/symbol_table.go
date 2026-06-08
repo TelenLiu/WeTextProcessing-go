@@ -112,6 +112,13 @@ func (st *SymbolTable) Size() int {
 	return len(st.idToSym)
 }
 
+// ForEachSymbol calls fn for each (id, symbol) pair in the table.
+func (st *SymbolTable) ForEachSymbol(fn func(id int32, sym string)) {
+	for id, sym := range st.idToSym {
+		fn(int32(id), sym)
+	}
+}
+
 // Copy creates a deep copy of the symbol table.
 func (st *SymbolTable) Copy() *SymbolTable {
 	ns := &SymbolTable{

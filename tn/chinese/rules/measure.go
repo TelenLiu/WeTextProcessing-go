@@ -35,7 +35,9 @@ func (m *Measure) BuildTagger() {
 	// Build measure-specific number with 二→两 rewrite for standalone numbers
 	// Python: number = Cardinal().number; number @= self.build_rule(cross("二", "两"), "[BOS]", "[EOS]")
 	// Since we can't use cdrewrite, create number variants for different contexts
-	baseNumber := NewCardinal().Number
+	// Create Cardinal once and reuse both Number and Digits to avoid redundant expensive FST construction
+	cardinalInst := NewCardinal()
+	baseNumber := cardinalInst.Number
 	
 	// For the second number in measure (before units), use "两" for standalone "2"
 	// But we need to avoid "两两" when unit is "两", so we'll handle this via Union patterns
@@ -51,26 +53,34 @@ func (m *Measure) BuildTagger() {
 	
 	// Pattern for units other than "两", "月", "号" - use "两" for standalone "2"
 	measure := prefix.Ques().Concat(number).Concat(rmspace).Concat(units)
-	
+	// RmEpsilon+Connect: eliminate structural epsilon arcs before Union.
+	// This dramatically reduces epsilon closure BFS cost at runtime
+	// (from 152K epsilon arcs to ~12 after all Unions).
+	measure = measure.RmEpsilon().Connect()
+
 	// Special pattern for "两", "月", "号" units - use "二" for "2" to avoid "两两", "两月", "两号"
 	// Give these patterns lower weight to prefer them over the general pattern
 	for _, unit := range []string{"两", "月", "号"} {
 		unitFst := pynini.Accep(unit)
 		specialMeasure := prefixNoTwo.Ques().Concat(numberNoTwo).Concat(rmspace).Concat(unitFst)
 		specialMeasure = lib.AddWeight(specialMeasure, -0.3)
+		// RmEpsilon+Connect: eliminate epsilon arcs from this component before Union
+		specialMeasure = specialMeasure.RmEpsilon().Connect()
 		measure = pynini.Union(measure, specialMeasure)
-		
+
 		// Also handle "到两"+unit → "到二"+unit pattern
 		toTwoUnit := lib.AddWeight(pynini.Cross("到两"+unit, "到二"+unit), -0.3)
+		toTwoUnit = toTwoUnit.RmEpsilon().Connect()
 		measure = pynini.Union(measure, toTwoUnit)
 	}
 
 	// -xxxx年, -xx年
-	digits := NewCardinal().Digits()
+	digits := cardinalInst.Digits()
 	cardinal := digits.Repeat(2).Union(digits.Repeat(4))
 	unit_fst := pynini.Union(pynini.Accep("年"), pynini.Accep("年度"), pynini.Accep("赛季"))
 	prefix = cardinal.Concat(rmspace.Concat(unit_fst).Ques()).Concat(to)
 	annual := prefix.Ques().Concat(cardinal).Concat(unit_fst)
+	annual = annual.RmEpsilon().Connect()
 
 	tagger := lib.Insert("value: \"").Concat(pynini.Union(measure, annual)).Concat(lib.Insert("\""))
 

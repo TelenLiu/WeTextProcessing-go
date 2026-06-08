@@ -28,7 +28,7 @@ func NewTime(args ...bool) *Time {
 func (t *Time) BuildTagger() {
 	suffixGraph := t.suffixGraph()
 	timeZoneGraph, _ := pynini.StringFile(tn.EnglishDataPath("data/time/zone.tsv"))
-	cardinal := NewCardinal(t.deterministic).Graph
+	cardinal := getSharedCardinal(t.deterministic).Graph
 
 	labelsHour := make([]string, 24)
 	for i := 0; i < 24; i++ {

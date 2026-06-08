@@ -360,6 +360,34 @@ func (p *Processor) SetCJKVCHAR(charsetPath string) {
 	p.NOT_SPACE = p.VCHAR.Difference(p.SPACE)
 }
 
+// ReleaseBaseFsts releases the large base FSTs that are only needed during
+// rule construction (BuildTagger/BuildVerbalizer) but not at runtime
+// (Normalize/Tag/Verbalize). After calling this method, the Processor's
+// VSIGMA, CHAR, SIGMA, NOT_QUOTE, NOT_SPACE, TO_LOWER, TO_UPPER,
+// INSERT_SPACE, DELETE_SPACE, DELETE_EXTRA_SPACE, DELETE_ZERO_OR_ONE_SPACE,
+// ALPHA, DIGIT, PUNCT, SPACE, VCHAR, LOWER, UPPER fields are set to nil.
+// Name, Ordertype, Tagger, Verbalizer, cache, and tokenParser are preserved.
+func (p *Processor) ReleaseBaseFsts() {
+	p.VSIGMA = nil
+	p.CHAR = nil
+	p.SIGMA = nil
+	p.NOT_QUOTE = nil
+	p.NOT_SPACE = nil
+	p.TO_LOWER = nil
+	p.TO_UPPER = nil
+	p.INSERT_SPACE = nil
+	p.DELETE_SPACE = nil
+	p.DELETE_EXTRA_SPACE = nil
+	p.DELETE_ZERO_OR_ONE_SPACE = nil
+	p.ALPHA = nil
+	p.DIGIT = nil
+	p.PUNCT = nil
+	p.SPACE = nil
+	p.VCHAR = nil
+	p.LOWER = nil
+	p.UPPER = nil
+}
+
 // FSTCacheStats returns the number of entries currently in memory cache.
 func (p *Processor) FSTCacheStats() (inMemory int, diskSizeMB float64) {
 	if p.cache == nil {

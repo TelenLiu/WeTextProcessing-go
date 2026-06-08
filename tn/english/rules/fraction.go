@@ -28,7 +28,7 @@ func NewFraction(args ...bool) *Fraction {
 }
 
 func (f *Fraction) BuildTagger() {
-	cardinal := NewCardinal(f.deterministic)
+	cardinal := getSharedCardinal(f.deterministic)
 	cardinalGraph := cardinal.Graph
 
 	integer := lib.Insert("integer_part: \"").Concat(cardinalGraph).Concat(lib.Insert("\""))
@@ -61,7 +61,7 @@ func (f *Fraction) BuildTagger() {
 }
 
 func (f *Fraction) BuildVerbalizer() {
-	ordinal := NewOrdinal(f.deterministic)
+	ordinal := getSharedOrdinal(f.deterministic)
 	suffix := ordinal.Suffix
 
 	integer := lib.DeleteString("integer_part: \"").Concat(
@@ -73,11 +73,12 @@ func (f *Fraction) BuildVerbalizer() {
 
 	// Singular denominators - with priority weights matching Python's _priority_union
 	denominatorOne := pynini.Cross("denominator: \"one\"", "over one")
-	denominatorHalf := lib.AddWeight(pynini.Cross("denominator: \"two\"", "half"), -0.0001)
-	denominatorQuarter := lib.AddWeight(pynini.Cross("denominator: \"four\"", "quarter"), -0.0001)
+	denominatorHalf := lib.AddWeight(pynini.Cross("denominator: \"two\"", "half"), -0.01)
+	denominatorQuarter := lib.AddWeight(pynini.Cross("denominator: \"four\"", "quarter"), -0.01)
 	// Other singular: apply ordinal suffix (e.g., "three" -> "third", "five" -> "fifth")
-	denominatorRestSingular := lib.DeleteString("denominator: \"").Concat(
-		f.NOT_QUOTE.Star().Compose(suffix)).Concat(lib.DeleteString("\""))
+	// Add positive weight to ensure half/quarter take priority over rest
+	denominatorRestSingular := lib.AddWeight(lib.DeleteString("denominator: \"").Concat(
+		f.NOT_QUOTE.Star().Compose(suffix)).Concat(lib.DeleteString("\"")), 0.01)
 
 	denominatorsSingular := pynini.Union(
 		denominatorOne,
@@ -87,12 +88,13 @@ func (f *Fraction) BuildVerbalizer() {
 	).Optimize()
 
 	// Plural denominators - with priority weights matching Python's _priority_union
-	denominatorHalves := lib.AddWeight(pynini.Cross("denominator: \"two\"", "halves"), -0.0001)
-	denominatorQuarters := lib.AddWeight(pynini.Cross("denominator: \"four\"", "quarters"), -0.0001)
+	denominatorHalves := lib.AddWeight(pynini.Cross("denominator: \"two\"", "halves"), -0.01)
+	denominatorQuarters := lib.AddWeight(pynini.Cross("denominator: \"four\"", "quarters"), -0.01)
 	// Other plural: apply ordinal suffix + "s" (e.g., "three" -> "thirds", "five" -> "fifths")
-	denominatorRestPlural := lib.DeleteString("denominator: \"").Concat(
+	// Add positive weight to ensure quarters/halves take priority over rest
+	denominatorRestPlural := lib.AddWeight(lib.DeleteString("denominator: \"").Concat(
 		f.NOT_QUOTE.Star().Compose(suffix)).Concat(
-		lib.Insert("s")).Concat(lib.DeleteString("\""))
+		lib.Insert("s")).Concat(lib.DeleteString("\"")), 0.01)
 
 	denominatorsPlural := pynini.Union(
 		denominatorOne,

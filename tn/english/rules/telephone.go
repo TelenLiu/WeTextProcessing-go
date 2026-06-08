@@ -45,9 +45,10 @@ func (t *Telephone) BuildTagger() {
 
 	areaPartDefault := digit.Concat(t.INSERT_SPACE).Concat(digit).Concat(t.INSERT_SPACE).Concat(digit)
 	areaPart800 := pynini.Cross("800", "eight hundred")
-	areaPart := areaPart800.Union(
-		t.VCHAR.Star().Difference(pynini.Accep("800")).Compose(areaPartDefault),
-	)
+	// Give areaPart800 a lower weight (higher priority) so it's preferred over
+	// the default area part. Difference with "800" doesn't work because
+	// Difference only handles single-char unions, not multi-char strings.
+	areaPart := lib.AddWeight(areaPart800, -0.001).Union(areaPartDefault)
 
 	areaPart = pynini.Union(
 		areaPart.Concat(lib.DeleteString("-").Union(lib.DeleteString("."))),
@@ -110,6 +111,9 @@ func (t *Telephone) BuildTagger() {
 			lib.Insert("number_part: \"")).Concat(ssnGraph.Optimize()).Concat(lib.Insert("\"")),
 	)
 
+	// RmEpsilon+Connect: eliminate epsilon arcs from Union and Insert wrappers
+	// before AddTokens. This reduces epsilon closure BFS cost at runtime.
+	graph = graph.RmEpsilon().Connect()
 	finalGraph := t.AddTokens(graph)
 	t.Tagger = finalGraph.Optimize()
 }

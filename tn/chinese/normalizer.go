@@ -4,6 +4,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/TelenLiu/WeTextProcessing-go/libs/pynini"
 	"github.com/TelenLiu/WeTextProcessing-go/libs/pynini/lib"
@@ -18,6 +19,7 @@ type zhRuleEntry struct {
 	verbalizer  *pynini.Fst
 	weight      float32
 	startLabels map[int32]bool // ilabels from the tagger start state (for fast skip)
+	triggerSet  map[rune]bool  // pre-computed rune set for fast trigger check
 }
 
 type Normalizer struct {
@@ -50,6 +52,10 @@ type Normalizer struct {
 
 	// Cached token parser for verbalizer
 	tokenParser *tn.TokenParser
+
+	// Pre-computed set of rune labels that can trigger any rule.
+	// If a character's label is not in this set, we skip all rules immediately.
+	triggerRunes map[rune]bool
 }
 
 func NewNormalizer(
@@ -141,56 +147,154 @@ func (n *Normalizer) buildTaggerInternal() {
 	// PreProcessor is not composed into FST
 	n.preProcessor = rules.NewPreProcessor(n.traditional_to_simple)
 
-	// Sort arcs for efficient binary search in composition
+	// Sort arcs for efficient binary search in composition.
+	// Apply RmEpsilon to eliminate epsilon arcs from tagger FSTs,
+	// which dramatically reduces epsilon closure BFS cost at runtime.
 	sortArcs := func(f *pynini.Fst) {
 		if f != nil && len(f.States) > 0 {
 			f.ArcSort("input")
 			f.PrepareForComposition()
 		}
 	}
+	optimizeTagger := func(f *pynini.Fst) *pynini.Fst {
+		if f == nil || len(f.States) == 0 {
+			return f
+		}
+		if len(f.States) > 10000 {
+			// Too large for RmEpsilon (causes arc explosion), just sort and prepare
+			f.ArcSort("input")
+			f.PrepareForComposition()
+			return f
+		}
+		// Apply RmEpsilon to eliminate epsilon transitions
+		optimized := f.RmEpsilon().Connect()
+		optimized.ArcSort("input")
+		optimized.PrepareForComposition()
+		return optimized
+	}
+	optimizeVerbalizer := func(f *pynini.Fst) *pynini.Fst {
+		if f == nil || len(f.States) == 0 {
+			return f
+		}
+		if len(f.States) > 10000 {
+			f.ArcSort("input")
+			f.PrepareForComposition()
+			return f
+		}
+		optimized := f.RmEpsilon().Connect()
+		optimized.ArcSort("input")
+		optimized.PrepareForComposition()
+		return optimized
+	}
 	sortArcs(n.cardinalRule.Tagger)
+	n.cardinalRule.Tagger = optimizeTagger(n.cardinalRule.Tagger)
 	sortArcs(n.cardinalRule.Verbalizer)
+	n.cardinalRule.Verbalizer = optimizeVerbalizer(n.cardinalRule.Verbalizer)
 	sortArcs(n.dateRule.Tagger)
+	n.dateRule.Tagger = optimizeTagger(n.dateRule.Tagger)
 	sortArcs(n.dateRule.Verbalizer)
+	n.dateRule.Verbalizer = optimizeVerbalizer(n.dateRule.Verbalizer)
 	sortArcs(n.whitelistRule.Tagger)
+	n.whitelistRule.Tagger = optimizeTagger(n.whitelistRule.Tagger)
 	sortArcs(n.whitelistRule.Verbalizer)
+	n.whitelistRule.Verbalizer = optimizeVerbalizer(n.whitelistRule.Verbalizer)
 	sortArcs(n.sportRule.Tagger)
+	n.sportRule.Tagger = optimizeTagger(n.sportRule.Tagger)
 	sortArcs(n.sportRule.Verbalizer)
+	n.sportRule.Verbalizer = optimizeVerbalizer(n.sportRule.Verbalizer)
 	sortArcs(n.fractionRule.Tagger)
+	n.fractionRule.Tagger = optimizeTagger(n.fractionRule.Tagger)
 	sortArcs(n.fractionRule.Verbalizer)
+	n.fractionRule.Verbalizer = optimizeVerbalizer(n.fractionRule.Verbalizer)
 	sortArcs(n.measureRule.Tagger)
+	n.measureRule.Tagger = optimizeTagger(n.measureRule.Tagger)
 	sortArcs(n.measureRule.Verbalizer)
+	n.measureRule.Verbalizer = optimizeVerbalizer(n.measureRule.Verbalizer)
 	sortArcs(n.moneyRule.Tagger)
+	n.moneyRule.Tagger = optimizeTagger(n.moneyRule.Tagger)
 	sortArcs(n.moneyRule.Verbalizer)
+	n.moneyRule.Verbalizer = optimizeVerbalizer(n.moneyRule.Verbalizer)
 	sortArcs(n.timeRule.Tagger)
+	n.timeRule.Tagger = optimizeTagger(n.timeRule.Tagger)
 	sortArcs(n.timeRule.Verbalizer)
+	n.timeRule.Verbalizer = optimizeVerbalizer(n.timeRule.Verbalizer)
 	sortArcs(n.mathRule.Tagger)
+	n.mathRule.Tagger = optimizeTagger(n.mathRule.Tagger)
 	sortArcs(n.mathRule.Verbalizer)
+	n.mathRule.Verbalizer = optimizeVerbalizer(n.mathRule.Verbalizer)
 	sortArcs(n.charRule.Tagger)
+	n.charRule.Tagger = optimizeTagger(n.charRule.Tagger)
 	sortArcs(n.charRule.Verbalizer)
+	n.charRule.Verbalizer = optimizeVerbalizer(n.charRule.Verbalizer)
+
+	// Release base FSTs from each rule's Processor — they are only needed
+	// during BuildTagger/BuildVerbalizer, not at runtime.
+	n.cardinalRule.ReleaseBaseFsts()
+	n.dateRule.ReleaseBaseFsts()
+	n.whitelistRule.ReleaseBaseFsts()
+	n.sportRule.ReleaseBaseFsts()
+	n.fractionRule.ReleaseBaseFsts()
+	n.measureRule.ReleaseBaseFsts()
+	n.moneyRule.ReleaseBaseFsts()
+	n.timeRule.ReleaseBaseFsts()
+	n.mathRule.ReleaseBaseFsts()
+	n.charRule.ReleaseBaseFsts()
+
+	// Release the Normalizer's own Processor base FSTs too — they are
+	// only used during construction, not at runtime.
+	n.Processor.ReleaseBaseFsts()
 
 	// Build ordered rule list for greedy matching.
 	// Lower weight = higher priority. Matching Python's add_weight ordering.
+	// Note: "char" rule is omitted because it's an identity mapping —
+	// unmatched characters are already output as-is by the fallback logic
+	// in Normalize(). Including char would cause every CJK character to
+	// trigger a compose call, making triggerRunes optimization useless.
 	n.zhRules = []zhRuleEntry{
-		{"date", n.dateRule.Tagger, n.dateRule.Verbalizer, 1.02, nil},
-		{"whitelist", n.whitelistRule.Tagger, n.whitelistRule.Verbalizer, 1.03, nil},
-		{"sport", n.sportRule.Tagger, n.sportRule.Verbalizer, 1.04, nil},
-		{"fraction", n.fractionRule.Tagger, n.fractionRule.Verbalizer, 1.05, nil},
-		{"measure", n.measureRule.Tagger, n.measureRule.Verbalizer, 1.05, nil},
-		{"money", n.moneyRule.Tagger, n.moneyRule.Verbalizer, 1.05, nil},
-		{"time", n.timeRule.Tagger, n.timeRule.Verbalizer, 1.05, nil},
-		{"cardinal", n.cardinalRule.Tagger, n.cardinalRule.Verbalizer, 1.06, nil},
-		{"math", n.mathRule.Tagger, n.mathRule.Verbalizer, 90, nil},
-		{"char", n.charRule.Tagger, n.charRule.Verbalizer, 100, nil},
+		{"date", n.dateRule.Tagger, n.dateRule.Verbalizer, 1.02, nil, nil},
+		{"whitelist", n.whitelistRule.Tagger, n.whitelistRule.Verbalizer, 1.03, nil, nil},
+		{"sport", n.sportRule.Tagger, n.sportRule.Verbalizer, 1.04, nil, nil},
+		{"fraction", n.fractionRule.Tagger, n.fractionRule.Verbalizer, 1.05, nil, nil},
+		{"measure", n.measureRule.Tagger, n.measureRule.Verbalizer, 1.05, nil, nil},
+		{"money", n.moneyRule.Tagger, n.moneyRule.Verbalizer, 1.05, nil, nil},
+		{"time", n.timeRule.Tagger, n.timeRule.Verbalizer, 1.05, nil, nil},
+		{"cardinal", n.cardinalRule.Tagger, n.cardinalRule.Verbalizer, 1.06, nil, nil},
+		{"math", n.mathRule.Tagger, n.mathRule.Verbalizer, 90, nil, nil},
 	}
 
-	// Pre-compute start labels for each rule's tagger FST.
+	// Pre-compute start labels and trigger sets for each rule's tagger FST.
 	for i := range n.zhRules {
 		n.zhRules[i].startLabels = computeStartLabels(n.zhRules[i].tagger)
+		if n.zhRules[i].tagger != nil && n.zhRules[i].tagger.Symbols != nil && len(n.zhRules[i].startLabels) > 0 {
+			ts := make(map[rune]bool, len(n.zhRules[i].startLabels))
+			for label := range n.zhRules[i].startLabels {
+				sym := n.zhRules[i].tagger.Symbols.Symbol(label)
+				if rns := []rune(sym); len(rns) == 1 {
+					ts[rns[0]] = true
+				}
+			}
+			n.zhRules[i].triggerSet = ts
+		}
 	}
+
 	sort.SliceStable(n.zhRules, func(i, j int) bool {
 		return n.zhRules[i].weight < n.zhRules[j].weight
 	})
+
+	// Pre-compute trigger runes: union of all rules' start label symbols.
+	// Used for fast "can any rule match?" check at each position.
+	n.triggerRunes = make(map[rune]bool, 64)
+	for _, r := range n.zhRules {
+		if r.tagger == nil || r.tagger.Symbols == nil {
+			continue
+		}
+		for label := range r.startLabels {
+			sym := r.tagger.Symbols.Symbol(label)
+			if rns := []rune(sym); len(rns) == 1 {
+				n.triggerRunes[rns[0]] = true
+			}
+		}
+	}
 
 	// Set minimal tagger/verbalizer for Processor interface compatibility
 	n.Tagger = pynini.NewFst()
@@ -222,6 +326,14 @@ type zhMatchResult struct {
 	weight     float32      // rule weight
 }
 
+// GetMeasureTagger returns the measure rule's tagger FST for analysis.
+func (n *Normalizer) GetMeasureTagger() *pynini.Fst {
+	if n.measureRule == nil {
+		return nil
+	}
+	return n.measureRule.Tagger
+}
+
 // Normalize applies full text normalization pipeline using greedy matching.
 // At each position, it tries all rules and picks the longest match
 // with the lowest weight.
@@ -240,6 +352,14 @@ func (n *Normalizer) Normalize(input string) string {
 	pos := 0
 
 	for pos < len(runes) {
+		// Fast-path: if the current character can't trigger any rule,
+		// output it as-is without trying any composition.
+		if len(n.triggerRunes) > 0 && !n.triggerRunes[runes[pos]] {
+			result.WriteRune(runes[pos])
+			pos++
+			continue
+		}
+
 		// Try to match each rule at the current position
 		best := n.findBestMatch(runes, pos)
 		if best != nil && best.inputLen > 0 {
@@ -294,33 +414,36 @@ func computeStartLabels(fst *pynini.Fst) map[int32]bool {
 }
 
 // findBestMatch tries all rules at the given position and returns the best match.
-// Optimized with startLabels fast-path and limited search depth.
+// Optimized with startLabels fast-path, limited search depth, and direct rune processing.
 func (n *Normalizer) findBestMatch(runes []rune, pos int) *zhMatchResult {
-	// Limit search depth: most Chinese TN matches are < 30 characters
-	const maxLen = 50
-	end := len(runes)
-	if end-pos > maxLen {
-		end = pos + maxLen
+	// Limit search depth: most Chinese TN matches are < 15 characters
+	// (longest is 11-digit phone number)
+	maxLen := 20
+	remaining := len(runes) - pos
+	if remaining < maxLen {
+		maxLen = remaining
 	}
-	remaining := string(runes[pos:end])
-	escaped := pynini.Escape(remaining)
 
 	var best *zhMatchResult
 
-	for _, r := range n.zhRules {
+	for i, r := range n.zhRules {
 		if r.tagger == nil || len(r.tagger.States) == 0 {
 			continue
 		}
 
 		// Fast-path: skip rules whose start state can't match the first character.
-		if len(r.startLabels) > 0 {
-			firstLabel := r.tagger.FindRuneLabel(runes[pos])
-			if firstLabel >= 0 && !r.startLabels[firstLabel] {
-				continue
-			}
+		// Use pre-computed triggerSet for O(1) rune lookup without FindRuneLabel.
+		if len(r.triggerSet) > 0 && !r.triggerSet[runes[pos]] {
+			continue
 		}
 
-		result := pynini.ComposePrefixShortestPath(escaped, r.tagger)
+		// Search depth: limit to maxLen, but only reduce if best covers remaining input
+		searchLen := maxLen
+		if best != nil && best.inputLen >= remaining {
+			searchLen = best.inputLen
+		}
+
+		result := pynini.ComposePrefixShortestPathRunes(runes, pos, searchLen, r.tagger)
 		if result.Consumed == 0 || result.Output == "" {
 			continue
 		}
@@ -343,16 +466,166 @@ func (n *Normalizer) findBestMatch(runes []rune, pos int) *zhMatchResult {
 			(candidate.inputLen == best.inputLen && candidate.weight < best.weight) {
 			best = candidate
 		}
+
+		// Early termination: if we matched the entire remaining input,
+		// check if the current best can be beaten by any remaining rule.
+		// Only break if best.totalWeight < nextRule.baseWeight (no future rule can beat it).
+		if best != nil && best.inputLen >= remaining {
+			canBeat := false
+			for j := i + 1; j < len(n.zhRules); j++ {
+				nextRule := n.zhRules[j]
+				if nextRule.tagger == nil || len(nextRule.tagger.States) == 0 {
+					continue
+				}
+				if len(nextRule.triggerSet) > 0 && !nextRule.triggerSet[runes[pos]] {
+					continue
+				}
+				if nextRule.weight < best.weight {
+					canBeat = true
+					break
+				}
+			}
+			if !canBeat {
+				break
+			}
+		}
 	}
 
 	return best
 }
 
 // applyVerbalizer applies the verbalizer to the tagged output.
+// Uses fast-path string extraction for common formats,
+// falling back to FST composition for complex formats (date, measure fraction, etc.).
 func (n *Normalizer) applyVerbalizer(tagOutput string, verbalizer *pynini.Fst) string {
 	if verbalizer == nil || len(verbalizer.States) == 0 {
 		return ""
 	}
 	reordered := n.tokenParser.Reorder(tagOutput)
+
+	// Fast-path: extract all quoted strings from the token content.
+	// This handles cardinal, money, time, measure(value), whitelist, sport, math
+	// without expensive FST composition.
+	// Falls back to FST for rules with Insert operations (date, fraction, measure numerator/denominator).
+	tokenName := ""
+	if idx := strings.Index(reordered, " { "); idx > 0 {
+		tokenName = reordered[:idx]
+	}
+	needsFst := tokenName == "date" || tokenName == "fraction" || tokenName == "time" ||
+		(tokenName == "measure" && strings.Contains(reordered, "numerator")) ||
+		(tokenName == "whitelist" && strings.Contains(reordered, "erhua"))
+	if !needsFst {
+		if result := extractQuotedContent(reordered); result != "" {
+			return result
+		}
+	}
+
 	return pynini.ComposeInputWithFst(pynini.Escape(reordered), nil, verbalizer)
+}
+
+// extractQuotedContent extracts all double-quoted strings from input and concatenates them.
+// Returns "" if no quoted content found.
+func extractQuotedContent(input string) string {
+	var result strings.Builder
+	i := 0
+	for i < len(input) {
+		q := strings.Index(input[i:], "\"")
+		if q < 0 {
+			break
+		}
+		start := i + q + 1
+		end := strings.Index(input[start:], "\"")
+		if end < 0 {
+			break
+		}
+		result.WriteString(input[start : start+end])
+		i = start + end + 1
+	}
+	if result.Len() == 0 {
+		return ""
+	}
+	return result.String()
+}
+
+// DebugRuleStats returns the number of states in each rule's tagger and verbalizer FSTs.
+func (n *Normalizer) DebugRuleStats() []struct {
+	Name         string
+	TaggerStates int
+	VerbStates   int
+	Weight       float32
+	StartLabels  int
+} {
+	var stats []struct {
+		Name         string
+		TaggerStates int
+		VerbStates   int
+		Weight       float32
+		StartLabels  int
+	}
+	for _, r := range n.zhRules {
+		ts, vs, sl := 0, 0, 0
+		if r.tagger != nil {
+			ts = len(r.tagger.States)
+		}
+		if r.verbalizer != nil {
+			vs = len(r.verbalizer.States)
+		}
+		if r.startLabels != nil {
+			sl = len(r.startLabels)
+		}
+		stats = append(stats, struct {
+			Name         string
+			TaggerStates int
+			VerbStates   int
+			Weight       float32
+			StartLabels  int
+		}{r.name, ts, vs, r.weight, sl})
+	}
+	return stats
+}
+
+// DebugPerRuleTiming measures per-rule composition timing for a given input.
+func (n *Normalizer) DebugPerRuleTiming(input string) []struct {
+	Name     string
+	States   int
+	Duration time.Duration
+	Consumed int
+	Output   string
+} {
+	runes := []rune(input)
+	var results []struct {
+		Name     string
+		States   int
+		Duration time.Duration
+		Consumed int
+		Output   string
+	}
+	for _, r := range n.zhRules {
+		if r.tagger == nil || len(r.tagger.States) == 0 {
+			continue
+		}
+		if len(r.triggerSet) > 0 && !r.triggerSet[runes[0]] {
+			continue
+		}
+		states := len(r.tagger.States)
+		// Warmup
+		for i := 0; i < 3; i++ {
+			pynini.ComposePrefixShortestPathRunes(runes, 0, 20, r.tagger)
+		}
+		iters := 50
+		start := time.Now()
+		var result pynini.ComposePrefixResult
+		for i := 0; i < iters; i++ {
+			result = pynini.ComposePrefixShortestPathRunes(runes, 0, 20, r.tagger)
+		}
+		elapsed := time.Since(start) / time.Duration(iters)
+		results = append(results, struct {
+			Name     string
+			States   int
+			Duration time.Duration
+			Consumed int
+			Output   string
+		}{r.name, states, elapsed, result.Consumed, result.Output})
+	}
+	return results
 }

@@ -42,6 +42,7 @@ func (d *Date) BuildTagger() {
 		mm_full.Concat(rmsign).Concat(year),
 		mm_full.Concat(rmsign).Concat(day),
 	)
+	date = date.RmEpsilon().Connect()
 	tagger := d.AddTokens(date)
 
 	to := pynini.Union(lib.DeleteString("-"), lib.DeleteString("~")).Concat(

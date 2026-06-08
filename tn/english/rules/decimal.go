@@ -24,13 +24,11 @@ type Decimal struct {
 	deterministic                     bool
 }
 
-func NewDecimal(args ...bool) *Decimal {
-	deterministic := false
-	if len(args) > 0 {
-		deterministic = args[0]
-	}
+// newDecimalInternal creates a Decimal instance without using the shared
+// singleton. Used by getSharedDecimal to avoid recursive Once calls.
+func newDecimalInternal(deterministic bool) *Decimal {
 	d := &Decimal{
-		Processor:   tn.NewProcessor("decimal", "en_tn"),
+		Processor:     tn.NewProcessor("decimal", "en_tn"),
 		deterministic: deterministic,
 	}
 	d.BuildTagger()
@@ -38,8 +36,16 @@ func NewDecimal(args ...bool) *Decimal {
 	return d
 }
 
+func NewDecimal(args ...bool) *Decimal {
+	deterministic := false
+	if len(args) > 0 {
+		deterministic = args[0]
+	}
+	return getSharedDecimal(deterministic)
+}
+
 func (d *Decimal) BuildTagger() {
-	cardinal := NewCardinal(d.deterministic)
+	cardinal := getSharedCardinal(d.deterministic)
 	cardinalGraph := cardinal.GraphWithAnd
 	cardinalGraphHundred := cardinal.GraphHundredComponentAtLeastOneNoneZeroDigit
 
@@ -85,8 +91,7 @@ func (d *Decimal) getQuantity(decimal, cardinalUpToHundred *pynini.Fst, includeA
 	quantities, _ := pynini.StringFile(tn.EnglishDataPath("data/number/thousand.tsv"))
 	quantitiesAbbr, _ := pynini.StringFile(tn.EnglishDataPath("data/number/quantity_abbr.tsv"))
 
-	tmpProcessor := tn.NewProcessor("tmp")
-	quantitiesAbbr = quantitiesAbbr.Union(tmpProcessor.TO_UPPER.Compose(quantitiesAbbr))
+	quantitiesAbbr = quantitiesAbbr.Union(d.TO_UPPER.Compose(quantitiesAbbr))
 
 	quantityWoThousand := pynini.Project(quantities, "input").Difference(
 		pynini.Union(pynini.Accep("k"), pynini.Accep("K"), pynini.Accep("thousand")),
@@ -121,7 +126,6 @@ func (d *Decimal) getQuantity(decimal, cardinalUpToHundred *pynini.Fst, includeA
 }
 
 func (d *Decimal) BuildVerbalizer() {
-	cardinal := NewCardinal(d.deterministic)
 	d.OptionalSign = pynini.Cross("negative: \"true\"", "minus ")
 	if !d.deterministic {
 		d.OptionalSign = d.OptionalSign.Union(
@@ -131,9 +135,9 @@ func (d *Decimal) BuildVerbalizer() {
 	d.OptionalSign = d.OptionalSign.Concat(d.DELETE_SPACE).Ques()
 
 	d.Integer = lib.DeleteString("integer_part:").Concat(
-		cardinal.DELETE_SPACE).Concat(
+		d.DELETE_SPACE).Concat(
 		lib.DeleteString("\"")).Concat(
-		cardinal.NOT_QUOTE.Star()).Concat(lib.DeleteString("\""))
+		d.NOT_QUOTE.Star()).Concat(lib.DeleteString("\""))
 	d.OptionalInteger = d.Integer.Concat(d.DELETE_SPACE).Concat(d.INSERT_SPACE).Ques()
 
 	d.FractionalDefault = lib.DeleteString("fractional_part:").Concat(

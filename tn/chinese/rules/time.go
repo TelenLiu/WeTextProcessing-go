@@ -47,6 +47,7 @@ func (t *Time) BuildTagger() {
 				Concat(lib.Insert("\"")).
 				Ques(),
 		)
+	tagger = tagger.RmEpsilon().Connect()
 	tagger = t.AddTokens(tagger)
 
 	to := lib.DeleteString("-").Union(lib.DeleteString("~")).

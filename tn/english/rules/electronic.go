@@ -26,7 +26,7 @@ func NewElectronic(args ...bool) *Electronic {
 }
 
 func (e *Electronic) BuildTagger() {
-	cardinal := NewCardinal(e.deterministic)
+	cardinal := getSharedCardinal(e.deterministic)
 	var numbers *pynini.Fst
 	if e.deterministic {
 		numbers = e.DIGIT
@@ -52,7 +52,7 @@ func (e *Electronic) BuildTagger() {
 
 	username := e.ALPHA.Union(dictWordsGraph).Concat(
 		e.ALPHA.Union(numbers).Union(acceptedSymbolsInput).Union(dictWordsGraph).Star())
-	username = lib.Insert("username: \"").Concat(username).Concat(lib.Insert("\"")).Concat(pynini.Accep("@"))
+	username = lib.Insert("username: \"").Concat(username).Concat(lib.Insert("\"")).Concat(pynini.Cross("@", " "))
 
 	domainGraph := allAcceptedSymbolsStart.Concat(
 		allAcceptedSymbolsEnd.Union(
@@ -95,6 +95,9 @@ func (e *Electronic) BuildTagger() {
 		protocol.Concat(lib.Insert(" ")).Concat(domainGraphWithClass),
 	)
 
+	// RmEpsilon+Connect: eliminate epsilon arcs from Union and Insert wrappers
+	// before AddTokens. This reduces epsilon closure BFS cost at runtime.
+	graph = graph.RmEpsilon().Connect()
 	finalGraph := e.AddTokens(graph)
 	e.Tagger = finalGraph.Optimize()
 }

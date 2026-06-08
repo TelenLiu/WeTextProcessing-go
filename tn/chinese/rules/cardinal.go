@@ -125,6 +125,7 @@ func (c *Cardinal) BuildTagger() {
 	cardinal = cardinal.Union(lib.AddWeight(phone, -1.0))
 
 	tagger := lib.Insert("value: \"").Concat(cardinal).Concat(lib.Insert("\""))
+	tagger = tagger.RmEpsilon().Connect()
 	c.Tagger = c.AddTokens(tagger)
 }
 

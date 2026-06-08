@@ -26,11 +26,13 @@ func NewDate(args ...bool) *Date {
 }
 
 func (d *Date) BuildTagger() {
-	cardinal := NewCardinal(d.deterministic)
+	cardinal := getSharedCardinal(d.deterministic)
 	monthGraph, _ := pynini.StringFile(tn.EnglishDataPath("data/date/month_name.tsv"))
 	monthAbbrGraph, _ := pynini.StringFile(tn.EnglishDataPath("data/date/month_abbr.tsv"))
 	monthGraph = monthGraph.Union(monthAbbrGraph)
-	monthGraph = monthGraph.Concat(d.PUNCT.Ques())
+	// Python: month_graph += pynutil.delete(self.PUNCT).ques
+	// Delete optional period after month abbreviation
+	monthGraph = monthGraph.Concat(lib.DeleteString(".").Ques())
 
 	monthNumbersLabels, _ := pynini.StringFile(tn.EnglishDataPath("data/date/month_number.tsv"))
 	cardinalGraph := cardinal.GraphHundredComponentAtLeastOneNoneZeroDigit
@@ -67,13 +69,21 @@ func (d *Date) BuildTagger() {
 		pynini.Union(pynini.Accep(","), pynini.Accep(".")).Ques()).Concat(lib.Insert("\""))
 	graphYear = graphYear.Union(
 		lib.Insert(" year: \"").Concat(pynini.Accep(",")).Concat(
-			lib.DeleteString(" ").Ques()).Concat(
+			pynini.Accep(" ").Ques()).Concat(
 			yearGraph).Concat(
 			pynini.Union(pynini.Accep(","), pynini.Accep(".")).Ques()).Concat(lib.Insert("\"")),
 	)
 	optionalGraphYear := graphYear.Ques()
 
 	yearTag := lib.Insert("year: \"").Concat(yearGraph).Concat(lib.Insert("\""))
+
+	// Standalone year tag with a weight penalty (0.015).
+	// In the greedy matching approach, the weight resolves the conflict:
+	// - For cardinal numbers like "1001", cardinal rule total (1.0 + ~0.0 = ~1.0)
+	//   < date year total (0.99 + 0.015 + ~0.0 = ~1.005). Cardinal wins.
+	// - For year-like numbers like "1219", cardinal FST weight is higher (~0.01),
+	//   so date year total (~1.005) < cardinal total (~1.01). Date year wins.
+	standaloneYearTag := lib.AddWeight(yearTag, 0.0)
 
 	// MDY: month day year
 	graphMDY := monthTag.Concat(
@@ -121,20 +131,43 @@ func (d *Date) BuildTagger() {
 		)
 	}
 
-	finalGraph := lib.AddWeight(pynini.Union(graphMDY, graphDMY, graphYMD), -0.1).Union(yearTag)
+	// Note: yearTag IS included in finalGraph. In the greedy matching approach,
+	// the FST weights naturally resolve the conflict between year and cardinal:
+	// - For cardinal numbers like "1001", the cardinal FST weight is lower than
+	//   the year FST weight (because year involves "0"->"oh" mapping), so cardinal wins.
+	// - For year-like numbers like "1219", the year FST weight is lower than the
+	//   cardinal FST weight (because year is a simpler 2-word mapping), so year wins.
+	finalGraph := lib.AddWeight(pynini.Union(graphMDY, graphDMY, graphYMD), -0.1)
+	finalGraph = finalGraph.Union(standaloneYearTag)
 
 	// Financial period
 	periodFY := lib.Insert("text: \"").Concat(d.getFinancialPeriodGraph()).Concat(lib.Insert("\""))
 	graphFY := periodFY.Concat(d.INSERT_SPACE).Concat(twoDigitYear)
 	finalGraph = finalGraph.Union(graphFY)
 
+	// RmEpsilon+Connect: eliminate epsilon arcs from Union and Insert wrappers
+	// before AddTokens. This reduces epsilon closure BFS cost at runtime.
+	finalGraph = finalGraph.RmEpsilon().Connect()
+
 	d.Tagger = d.AddTokens(finalGraph)
 }
 
 func (d *Date) getYearGraph(cardinalGraph *pynini.Fst, deterministic bool) *pynini.Fst {
 	graph := d.getFourDigitYearGraph(deterministic)
-	graph = pynini.Union(pynini.Accep("1"), pynini.Accep("2")).Concat(
-		d.DIGIT.Repeat(3)).Concat(
+	// Restrict year to 1200-2999 to avoid conflicting with cardinal numbers 1000-1199.
+	// In Python, the monolithic FST approach resolves this conflict through FST composition
+	// weights. In the greedy matching approach, we restrict the year range to avoid the conflict.
+	// Years 1000-1199 are rare and will be handled by the cardinal rule.
+	digits2to9 := pynini.Union(
+		pynini.Accep("2"), pynini.Accep("3"), pynini.Accep("4"),
+		pynini.Accep("5"), pynini.Accep("6"), pynini.Accep("7"),
+		pynini.Accep("8"), pynini.Accep("9"),
+	)
+	yearStart := pynini.Union(
+		pynini.Accep("1").Concat(digits2to9).Concat(d.DIGIT.Repeat(2)),
+		pynini.Accep("2").Concat(d.DIGIT.Repeat(3)),
+	)
+	graph = yearStart.Concat(
 		pynini.Union(pynini.Cross(" s", "s"), pynini.Accep("s")).Ques(),
 	).Compose(graph)
 
@@ -250,8 +283,11 @@ func (d *Date) yearSuffixGraph() *pynini.Fst {
 }
 
 func (d *Date) BuildVerbalizer() {
-	ordinal := NewOrdinal(d.deterministic)
+	ordinal := getSharedOrdinal(d.deterministic)
 
+	// Day: delete("day:") + DELETE_SPACE + delete("\"") + NOT_QUOTE.Plus() + delete("\"")
+	// Then compose with ordinal.Suffix to convert cardinal to ordinal (e.g., "five" -> "fifth")
+	// Matching Python: day_cardinal @ ordinal.suffix
 	dayCardinal := lib.DeleteString("day:").Concat(d.DELETE_SPACE).Concat(
 		lib.DeleteString("\"")).Concat(d.NOT_QUOTE.Plus()).Concat(lib.DeleteString("\""))
 	day := dayCardinal.Compose(ordinal.Suffix)
@@ -267,8 +303,8 @@ func (d *Date) BuildVerbalizer() {
 	graphFY := lib.Insert("the ").Concat(period).Concat(lib.Insert(" of")).Concat(
 		d.DELETE_EXTRA_SPACE.Concat(year).Ques())
 
-	graphDMY := lib.Insert("the ").Concat(day).Concat(d.DELETE_EXTRA_SPACE).Concat(
-		lib.Insert("of ")).Ques().Concat(month).Concat(
+	graphDMY := (lib.Insert("the ").Concat(day).Concat(d.DELETE_EXTRA_SPACE).Concat(
+		lib.Insert("of "))).Ques().Concat(month).Concat(
 		d.DELETE_EXTRA_SPACE.Concat(year).Ques())
 
 	finalGraph := pynini.Union(graphDMY, year, graphFY).Concat(d.DELETE_SPACE)

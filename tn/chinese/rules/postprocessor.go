@@ -147,16 +147,17 @@ func (p *PostProcessor) Apply(input string) string {
 			continue
 		}
 
-		// Remove punctuations
-		if p.remove_puncts && p.puncts[chStr] {
-			continue
-		}
-
-		// Full to half conversion
+		// Full to half conversion (before remove_puncts so that
+		// convertible punctuation survives as half-width)
 		if p.full_to_half {
 			if repl, ok := p.full2half[chStr]; ok {
 				chStr = repl
 			}
+		}
+
+		// Remove punctuations (after full_to_half so converted chars survive)
+		if p.remove_puncts && p.puncts[chStr] {
+			continue
 		}
 
 		// Tag OOV characters

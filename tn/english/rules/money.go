@@ -9,6 +9,7 @@ import (
 type Money struct {
 	*tn.Processor
 	deterministic bool
+	decimal       *Decimal
 }
 
 func NewMoney(args ...bool) *Money {
@@ -26,10 +27,9 @@ func NewMoney(args ...bool) *Money {
 }
 
 func (m *Money) BuildTagger() {
-	cardinal := NewCardinal(m.deterministic)
+	cardinal := getSharedCardinal(m.deterministic)
 	cardinalGraph := cardinal.GraphWithAnd
-	decimal := NewDecimal(m.deterministic)
-	graphDecimalFinal := decimal.FinalGraphWoNegativeWAbbr
+	m.decimal = getSharedDecimal(m.deterministic)
 
 	majSingular, _ := pynini.StringFile(tn.EnglishDataPath("data/money/currency_major.tsv"))
 	majUnitPlural := majSingular.Compose(SingularToPlural())
@@ -43,15 +43,7 @@ func (m *Money) BuildTagger() {
 
 	graphIntegerOne := lib.Insert("integer_part: \"").Concat(pynini.Cross("1", "one")).Concat(lib.Insert("\""))
 
-	decimalDeleteLastZeros := m.DIGIT.Union(lib.DeleteString(",")).Star().Concat(
-		pynini.Accep(".")).Concat(m.DIGIT.Plus()).Concat(
-		lib.AddWeight(lib.DeleteString("0"), -0.01).Star())
-
-	decimalWithQuantity := m.VCHAR.Star().Concat(m.ALPHA)
-
-	graphDecimal := graphMajPlural.Concat(m.INSERT_SPACE).Concat(
-		decimalDeleteLastZeros.Union(decimalWithQuantity)).Compose(graphDecimalFinal)
-
+	// Integer-only money: $12, $1
 	graphInteger := lib.Insert("integer_part: \"").Concat(
 		m.VCHAR.Star().Difference(pynini.Accep("1")).Compose(cardinalGraph)).Concat(lib.Insert("\""))
 
@@ -60,24 +52,48 @@ func (m *Money) BuildTagger() {
 		graphMajPlural.Concat(m.INSERT_SPACE).Concat(graphInteger),
 	)
 
-	finalGraph := graphIntegerOnly.Concat(optionalDeleteFractionalZeros).Union(graphDecimal)
+	// Integer-only with quantity: $1 million, $2 billion
+	// Python: decimal_with_quantity @ graph_decimal_final handles this
+	quantity, _ := pynini.StringFile(tn.EnglishDataPath("data/number/thousand.tsv"))
+	graphQuantity := lib.Insert(" quantity: \"").Concat(quantity).Concat(lib.Insert("\""))
+	graphIntegerWithQuantity := graphMajPlural.Concat(m.INSERT_SPACE).Concat(
+		graphInteger.Concat(lib.DeleteString(" ").Ques()).Concat(graphQuantity))
+
+	// Decimal money: $12.345
+	graphDecimalInteger := lib.Insert("integer_part: \"").Concat(cardinalGraph).Concat(lib.Insert("\""))
+	graphDecimalFractional := lib.Insert("fractional_part: \"").Concat(m.decimal.Graph).Concat(lib.Insert("\""))
+
+	graphDecimalWoSign := graphDecimalInteger.Concat(
+		lib.Insert(" ")).Ques().Concat(
+		lib.DeleteString(".")).Concat(
+		lib.Insert(" ")).Concat(
+		graphDecimalFractional)
+
+	graphDecimal := graphMajPlural.Concat(m.INSERT_SPACE).Concat(graphDecimalWoSign)
+
+	// Decimal with quantity: $1.2 million
+	graphDecimalWithQuantity := graphMajPlural.Concat(m.INSERT_SPACE).Concat(
+		graphDecimalWoSign.Concat(lib.DeleteString(" ").Ques()).Concat(graphQuantity))
+
+	graphDecimal = graphDecimal.Union(graphDecimalWithQuantity)
+
+	finalGraph := graphIntegerOnly.Concat(optionalDeleteFractionalZeros).Union(graphDecimal).Union(graphIntegerWithQuantity)
 	m.Tagger = m.AddTokens(finalGraph.Optimize())
 }
 
 func (m *Money) BuildVerbalizer() {
-	decimal := NewDecimal(m.deterministic)
 	keepSpace := pynini.Accep(" ")
 	maj := lib.DeleteString("currency_maj: \"").Concat(m.NOT_QUOTE.Plus()).Concat(lib.DeleteString("\""))
 
-	integerPart := decimal.DELETE_SPACE.Concat(
-		lib.DeleteString("\"")).Concat(decimal.NOT_QUOTE.Star()).Concat(lib.DeleteString("\""))
+	// Use decimal.Integer which includes delete("integer_part:") prefix
+	integerPart := m.decimal.Integer
 
 	// graph_integer: integer_part + space + currency_maj
 	graphInteger := integerPart.Concat(keepSpace).Concat(maj)
 
 	// graph_decimal: decimal.numbers (optional_sign + integer + fractional_part) + space + currency_maj
 	// Matching Python: decimal.numbers + keep_space + maj
-	graphDecimal := decimal.Numbers.Concat(keepSpace).Concat(maj)
+	graphDecimal := m.decimal.Numbers.Concat(keepSpace).Concat(maj)
 
 	graph := graphInteger.Union(graphDecimal)
 	deleteTokens := m.DeleteTokens(graph)

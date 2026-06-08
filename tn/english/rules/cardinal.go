@@ -19,11 +19,9 @@ type Cardinal struct {
 	deterministic                                bool
 }
 
-func NewCardinal(args ...bool) *Cardinal {
-	deterministic := false
-	if len(args) > 0 {
-		deterministic = args[0]
-	}
+// newCardinalInternal creates a Cardinal instance without using the shared
+// singleton. Used by getSharedCardinal to avoid recursive Once calls.
+func newCardinalInternal(deterministic bool) *Cardinal {
 	c := &Cardinal{
 		Processor:     tn.NewProcessor("cardinal", "en_tn"),
 		deterministic: deterministic,
@@ -31,6 +29,14 @@ func NewCardinal(args ...bool) *Cardinal {
 	c.BuildTagger()
 	c.BuildVerbalizer()
 	return c
+}
+
+func NewCardinal(args ...bool) *Cardinal {
+	deterministic := false
+	if len(args) > 0 {
+		deterministic = args[0]
+	}
+	return getSharedCardinal(deterministic)
 }
 
 func (c *Cardinal) BuildTagger() {
@@ -65,8 +71,10 @@ func (c *Cardinal) BuildTagger() {
 	)
 	higher := pynini.Union(two_digits, hundred_wo, lib.AddWeight(zero3, -0.01)).Optimize()
 
-	c.Graph = last_grp
+	// c.Graph is used by ordinal and time rules for composition. It needs the full
+	// cardinal graph (including thousand-level handling), not just last_grp.
 	c.GraphWithAnd = last_grp
+	c.Graph = last_grp // will be updated to the full graph after all levels are built
 
 	// Build 3-digit input patterns that handle leading zeros in intermediate groups.
 	// The original 3-digit composition doesn't handle "024" -> "twenty four",
@@ -132,8 +140,35 @@ func (c *Cardinal) BuildTagger() {
 
 	all := allLevels[len(allLevels)-1]
 
+	// add_optional_and: Python's add_optional_and adds variants:
+	// 1. "hundred " -> "hundred and " (already handled in hundred_wa)
+	// 2. optional_hundred: for 3-digit numbers, allow omitting "hundred"
+	//    e.g., "256" -> "two fifty six" (in addition to "two hundred and fifty six")
+	// Python: optional_hundred = compose((DIGIT - "0")**3, graph) then
+	// compose(optional_hundred, VCHAR* + cross(" hundred", "") + VCHAR*)
+	// We implement this directly: digit_t + " " + (DIGIT{2} @ two_digits_with_zero)
+	// Weight is set higher than hundred_wa (0.02) so "two hundred and fifty six"
+	// is preferred by default, but "two fifty six" is available as alternative.
+	dig2 := c.DIGIT.Concat(c.DIGIT)
+	optionalHundred := lib.AddWeight(
+		digit_t.Concat(lib.Insert(" ")).Concat(dig2.Compose(two_digits_with_zero)),
+		0.03,
+	)
+	all = all.Union(optionalHundred).Optimize()
+
+	// Build SingleDigitsGraph with both "zero" and "oh" variants.
+	// Python: single_digits_graph_zero uses "zero", single_digits_graph_oh uses "oh".
+	// The same variant must be used consistently within a single token.
+	// "zero" variant is preferred (lower weight) matching Python's default behavior.
+	graphOh := pynini.Union(graph_digit).Invert().Union(pynini.Cross("0", "oh"))
+	singleDigitsOh := lib.AddWeight(
+		graphOh.Concat(lib.Insert(" ").Concat(graphOh).Star()),
+		0.0001,
+	)
+	singleDigitsZero := digit_t.Concat(lib.Insert(" ").Concat(digit_t).Star())
+
 	c.SingleDigitsGraph = lib.AddWeight(
-		digit_t.Concat(lib.Insert(" ").Concat(digit_t).Star()), 0.1,
+		singleDigitsZero.Union(singleDigitsOh), 0.1,
 	)
 
 	// Tagger: positive: "integer: ...", negative: "negative: true integer: ..."
@@ -143,6 +178,9 @@ func (c *Cardinal) BuildTagger() {
 		lib.Insert("integer: \"").Concat(all).Concat(lib.Insert("\"")),
 	)
 	tagger := pynini.Union(posTag, negTag)
+	// RmEpsilon+Connect: eliminate epsilon arcs from Union and Insert wrappers
+	// before AddTokens. This reduces epsilon closure BFS cost at runtime.
+	tagger = tagger.RmEpsilon().Connect()
 	c.Tagger = c.AddTokens(tagger)
 
 	atLeastOneNonzero := pynini.Union(

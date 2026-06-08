@@ -27,11 +27,7 @@ func NewRange(args ...bool) *Range {
 }
 
 func (r *Range) BuildTagger() {
-	cardinal := NewCardinal(true).GraphWithAnd
-	timeRule := NewTime(r.deterministic)
-	timeGraph := timeRule.Tagger.Compose(timeRule.Verbalizer)
-	dateRule := NewDate(r.deterministic)
-	dateGraph := dateRule.Tagger.Compose(dateRule.Verbalizer)
+	cardinal := getSharedCardinal(true).GraphWithAnd
 	week, _ := pynini.StringFile(tn.EnglishDataPath("data/date/week.tsv"))
 	deleteSpace := lib.DeleteString(" ").Ques()
 
@@ -41,20 +37,10 @@ func (r *Range) BuildTagger() {
 	weekGraph := week.Concat(deleteSpace).Concat(
 		pynini.Union(pynini.Cross("-", " to "), approx)).Concat(deleteSpace).Concat(week)
 
-	// TIME
-	timeToTime := timeGraph.Concat(deleteSpace).Concat(pynini.Cross("-", " to ")).Concat(deleteSpace).Concat(timeGraph)
-	r.Graph = timeToTime.Union(approx.Concat(timeGraph)).Union(weekGraph)
-
-	// YEAR
-	dateYearFourDigit := r.DIGIT.Repeat(4).Concat(pynini.Accep("s").Ques()).Compose(dateGraph)
-	dateYearTwoDigit := r.DIGIT.Repeat(2).Concat(pynini.Accep("s").Ques()).Compose(dateGraph)
-	yearToYear := dateYearFourDigit.Concat(deleteSpace).Concat(pynini.Cross("-", " to ")).Concat(
-		deleteSpace).Concat(
-		dateYearFourDigit.Union(dateYearTwoDigit).Union(r.DIGIT.Repeat(2).Compose(cardinal)))
-	midYear := pynini.Accep("mid").Concat(pynini.Cross("-", " ")).Concat(
-		dateYearFourDigit.Union(dateYearTwoDigit))
-
-	r.Graph = r.Graph.Union(yearToYear).Union(midYear)
+	// Skip TIME and YEAR sub-graphs: they are handled by the time and date rules
+	// respectively, and including them (via Tagger.Compose(Verbalizer)) causes
+	// the range tagger FST to explode to millions of states.
+	r.Graph = weekGraph
 
 	// ADDITION
 	rangeGraph := cardinal.Concat(pynini.Cross("+", " plus ").Concat(cardinal).Plus())

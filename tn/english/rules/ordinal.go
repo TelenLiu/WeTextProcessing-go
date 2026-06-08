@@ -14,13 +14,11 @@ type Ordinal struct {
 	deterministic bool
 }
 
-func NewOrdinal(args ...bool) *Ordinal {
-	deterministic := false
-	if len(args) > 0 {
-		deterministic = args[0]
-	}
+// newOrdinalInternal creates an Ordinal instance without using the shared
+// singleton. Used by getSharedOrdinal to avoid recursive Once calls.
+func newOrdinalInternal(deterministic bool) *Ordinal {
 	o := &Ordinal{
-		Processor:   tn.NewProcessor("ordinal", "en_tn"),
+		Processor:     tn.NewProcessor("ordinal", "en_tn"),
 		deterministic: deterministic,
 	}
 	o.BuildTagger()
@@ -28,8 +26,16 @@ func NewOrdinal(args ...bool) *Ordinal {
 	return o
 }
 
+func NewOrdinal(args ...bool) *Ordinal {
+	deterministic := false
+	if len(args) > 0 {
+		deterministic = args[0]
+	}
+	return getSharedOrdinal(deterministic)
+}
+
 func (o *Ordinal) BuildTagger() {
-	cardinal := NewCardinal(o.deterministic)
+	cardinal := getSharedCardinal(o.deterministic)
 	cardinalGraph := cardinal.Graph
 	cardinalFormat := pynini.Union(o.DIGIT, lib.DeleteString(",")).Star()
 

@@ -168,17 +168,15 @@ func (f *Fst) RmEpsilon() *Fst {
 
 	result := f.copy()
 
-	// Compute epsilon closure with accumulated weights for each state.
-	// epsClosureWeights[s] = map[state]accumulatedWeight via epsilon-epsilon arcs.
-	epsClosure := make([][]int32, len(result.States))
-	epsClosureWeight := make([]map[int32]float32, len(result.States))
+	// Streaming RmEpsilon: compute epsilon closure one state at a time
+	// to avoid O(n * avg_closure_size) memory usage.
+	// We compute closures on the ORIGINAL FST (f) to ensure correctness
+	// even as we modify the result.
 	for s := range result.States {
-		epsClosure[s], epsClosureWeight[s] = computeEpsilonClosureWithWeights(result, int32(s))
-	}
+		// Compute epsilon closure for state s on the original FST
+		closure, weights := computeEpsilonClosureWithWeights(f, int32(s))
 
-	// For each state, add arcs from epsilon-reachable states
-	for s := range result.States {
-		newArcs := make([]Arc, 0, len(result.States[s].Arcs))
+		newArcs := make([]Arc, 0, len(result.States[s].Arcs)+len(closure)*2)
 		newIEps := int32(0)
 		newOEps := int32(0)
 
@@ -195,14 +193,13 @@ func (f *Fst) RmEpsilon() *Fst {
 			}
 		}
 
-		// Add non-epsilon arcs from epsilon-reachable states, adding the
-		// accumulated epsilon path weight to each copied arc.
-		for _, epsState := range epsClosure[s] {
+		// Add non-epsilon arcs from epsilon-reachable states
+		for _, epsState := range closure {
 			if epsState == int32(s) {
 				continue
 			}
-			epsWeight := epsClosureWeight[s][epsState]
-			for _, arc := range result.States[epsState].Arcs {
+			epsWeight := weights[epsState]
+			for _, arc := range f.States[epsState].Arcs {
 				if arc.ILabel != EpsilonLabel || arc.OLabel != EpsilonLabel {
 					weightedArc := arc
 					weightedArc.Weight += epsWeight
@@ -216,8 +213,8 @@ func (f *Fst) RmEpsilon() *Fst {
 				}
 			}
 			// Propagate finality with accumulated epsilon weight
-			if result.States[epsState].Final {
-				totalWeight := result.States[epsState].Weight + epsWeight
+			if f.States[epsState].Final {
+				totalWeight := f.States[epsState].Weight + epsWeight
 				if !result.States[s].Final || totalWeight < result.States[s].Weight {
 					result.States[s].Final = true
 					result.States[s].Weight = totalWeight
