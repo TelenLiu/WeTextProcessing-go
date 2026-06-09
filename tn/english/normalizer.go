@@ -71,6 +71,18 @@ func NewNormalizer(
 	overwriteCache bool,
 	progress ...tn.BuildProgressFn,
 ) *Normalizer {
+	return NewNormalizerEx(cacheDir, overwriteCache, nil, progress...)
+}
+
+// NewNormalizerEx creates a Normalizer with an extended progress callback
+// that includes estimated remaining time. progressEx is called in addition
+// to any basic BuildProgressFn provided in the progress variadic args.
+func NewNormalizerEx(
+	cacheDir string,
+	overwriteCache bool,
+	progressEx tn.BuildProgressExFn,
+	progress ...tn.BuildProgressFn,
+) *Normalizer {
 	// Note: Do NOT call ResetCJKVCHAR() here. It clears the global cjkVCHAR
 	// which can race with concurrent Chinese normalizer initialization,
 	// causing Chinese rule Processors to lose CJK character support.
@@ -87,6 +99,12 @@ func NewNormalizer(
 	var pf tn.BuildProgressFn
 	if len(progress) > 0 {
 		pf = progress[0]
+	}
+	// Record build start time and set extended progress callback
+	// before any build operations begin.
+	n.Processor.SetBuildStartTime(time.Now())
+	if progressEx != nil {
+		n.Processor.SetBuildProgressEx(progressEx)
 	}
 	// Per-rule mode: only need base FST caching, not monolithic tagger/verbalizer.
 	n.Processor.InitBaseFstCache("en_tn", cacheDir, overwriteCache, pf)
@@ -215,10 +233,7 @@ func (n *Normalizer) buildTaggerInternal() {
 	n.Verbalizer = pynini.NewFst()
 
 	n.buildTime = time.Since(t0)
-	_, progress := n.Processor.GetBuildConfig()
-	if progress != nil {
-		progress("完成", 14, 14)
-	}
+	n.Processor.ReportProgress("完成", 14, 14)
 }
 
 // enRuleCacheNames lists the English rule names and their expected cache files.
@@ -263,7 +278,7 @@ func (n *Normalizer) checkRuleCacheExists() bool {
 // loadRulesFromCache loads all rule Tagger/Verbalizer FSTs from disk cache.
 // Cached FSTs are already optimized, so no RmEpsilon/Connect/ArcSort is needed.
 func (n *Normalizer) loadRulesFromCache() {
-	concurrency, progress := n.Processor.GetBuildConfig()
+	concurrency, _ := n.Processor.GetBuildConfig()
 
 	type loadTask struct {
 		name string
@@ -361,9 +376,7 @@ func (n *Normalizer) loadRulesFromCache() {
 			sem <- struct{}{}
 			task.fn()
 			<-sem
-			if progress != nil {
-				progress("加载缓存-"+task.name, idx+1, len(tasks))
-			}
+			n.Processor.ReportProgress("加载缓存-"+task.name, idx+1, len(tasks))
 		}(t, i)
 	}
 	wg.Wait()
@@ -371,7 +384,7 @@ func (n *Normalizer) loadRulesFromCache() {
 
 // buildRulesFromScratch builds all rule FSTs from scratch (the original logic).
 func (n *Normalizer) buildRulesFromScratch() {
-	concurrency, progress := n.Processor.GetBuildConfig()
+	concurrency, _ := n.Processor.GetBuildConfig()
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
 
@@ -399,9 +412,7 @@ func (n *Normalizer) buildRulesFromScratch() {
 			sem <- struct{}{}
 			tt.fn()
 			<-sem
-			if progress != nil {
-				progress("构建Tagger-"+tt.name, idx+1, len(tasks))
-			}
+			n.Processor.ReportProgress("构建Tagger-"+tt.name, idx+1, len(tasks))
 		}(t, i)
 	}
 	wg.Wait()
@@ -446,58 +457,72 @@ func (n *Normalizer) buildRulesFromScratch() {
 	n.cardinalRule.Tagger = optimizeTagger(n.cardinalRule.Tagger)
 	sortArcs(n.cardinalRule.Verbalizer)
 	n.cardinalRule.Verbalizer = optimizeVerbalizer(n.cardinalRule.Verbalizer)
+	n.Processor.ReportProgress("优化-cardinal", 1, 14)
 	sortArcs(n.ordinalRule.Tagger)
 	n.ordinalRule.Tagger = optimizeTagger(n.ordinalRule.Tagger)
 	sortArcs(n.ordinalRule.Verbalizer)
 	n.ordinalRule.Verbalizer = optimizeVerbalizer(n.ordinalRule.Verbalizer)
+	n.Processor.ReportProgress("优化-ordinal", 2, 14)
 	sortArcs(n.decimalRule.Tagger)
 	n.decimalRule.Tagger = optimizeTagger(n.decimalRule.Tagger)
 	sortArcs(n.decimalRule.Verbalizer)
 	n.decimalRule.Verbalizer = optimizeVerbalizer(n.decimalRule.Verbalizer)
+	n.Processor.ReportProgress("优化-decimal", 3, 14)
 	sortArcs(n.fractionRule.Tagger)
 	n.fractionRule.Tagger = optimizeTagger(n.fractionRule.Tagger)
 	sortArcs(n.fractionRule.Verbalizer)
 	n.fractionRule.Verbalizer = optimizeVerbalizer(n.fractionRule.Verbalizer)
+	n.Processor.ReportProgress("优化-fraction", 4, 14)
 	sortArcs(n.dateRule.Tagger)
 	n.dateRule.Tagger = optimizeTagger(n.dateRule.Tagger)
 	sortArcs(n.dateRule.Verbalizer)
 	n.dateRule.Verbalizer = optimizeVerbalizer(n.dateRule.Verbalizer)
+	n.Processor.ReportProgress("优化-date", 5, 14)
 	sortArcs(n.timeRule.Tagger)
 	n.timeRule.Tagger = optimizeTagger(n.timeRule.Tagger)
 	sortArcs(n.timeRule.Verbalizer)
 	n.timeRule.Verbalizer = optimizeVerbalizer(n.timeRule.Verbalizer)
+	n.Processor.ReportProgress("优化-time", 6, 14)
 	sortArcs(n.moneyRule.Tagger)
 	n.moneyRule.Tagger = optimizeTagger(n.moneyRule.Tagger)
 	sortArcs(n.moneyRule.Verbalizer)
 	n.moneyRule.Verbalizer = optimizeVerbalizer(n.moneyRule.Verbalizer)
+	n.Processor.ReportProgress("优化-money", 7, 14)
 	sortArcs(n.telephoneRule.Tagger)
 	n.telephoneRule.Tagger = optimizeTagger(n.telephoneRule.Tagger)
 	sortArcs(n.telephoneRule.Verbalizer)
 	n.telephoneRule.Verbalizer = optimizeVerbalizer(n.telephoneRule.Verbalizer)
+	n.Processor.ReportProgress("优化-telephone", 8, 14)
 	sortArcs(n.whitelistRule.Tagger)
 	n.whitelistRule.Tagger = optimizeTagger(n.whitelistRule.Tagger)
 	sortArcs(n.whitelistRule.Verbalizer)
 	n.whitelistRule.Verbalizer = optimizeVerbalizer(n.whitelistRule.Verbalizer)
+	n.Processor.ReportProgress("优化-whitelist", 9, 14)
 	sortArcs(n.rangeRule.Tagger)
 	n.rangeRule.Tagger = optimizeTagger(n.rangeRule.Tagger)
 	sortArcs(n.rangeRule.Verbalizer)
 	n.rangeRule.Verbalizer = optimizeVerbalizer(n.rangeRule.Verbalizer)
+	n.Processor.ReportProgress("优化-range", 10, 14)
 	sortArcs(n.wordRule.Tagger)
 	n.wordRule.Tagger = optimizeTagger(n.wordRule.Tagger)
 	sortArcs(n.wordRule.Verbalizer)
 	n.wordRule.Verbalizer = optimizeVerbalizer(n.wordRule.Verbalizer)
+	n.Processor.ReportProgress("优化-word", 11, 14)
 	sortArcs(n.punctRule.Tagger)
 	n.punctRule.Tagger = optimizeTagger(n.punctRule.Tagger)
 	sortArcs(n.punctRule.Verbalizer)
 	n.punctRule.Verbalizer = optimizeVerbalizer(n.punctRule.Verbalizer)
+	n.Processor.ReportProgress("优化-punct", 12, 14)
 	sortArcs(n.measureRule.Tagger)
 	n.measureRule.Tagger = optimizeTagger(n.measureRule.Tagger)
 	sortArcs(n.measureRule.Verbalizer)
 	n.measureRule.Verbalizer = optimizeVerbalizer(n.measureRule.Verbalizer)
+	n.Processor.ReportProgress("优化-measure", 13, 14)
 	sortArcs(n.electronicRule.Tagger)
 	n.electronicRule.Tagger = optimizeTagger(n.electronicRule.Tagger)
 	sortArcs(n.electronicRule.Verbalizer)
 	n.electronicRule.Verbalizer = optimizeVerbalizer(n.electronicRule.Verbalizer)
+	n.Processor.ReportProgress("优化-electronic", 14, 14)
 }
 
 // saveRulesToCache saves all per-rule FSTs to disk cache.

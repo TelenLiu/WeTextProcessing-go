@@ -45,8 +45,10 @@ type Processor struct {
 	verbalizerRef       *pynini.Fst // cached verbalizer FST reference for fast access
 
 	// Build configuration
-	buildConcurrency int
-	buildProgress    BuildProgressFn
+	buildConcurrency  int
+	buildProgress     BuildProgressFn
+	buildProgressEx   BuildProgressExFn
+	buildStartTime    time.Time
 
 	// Lazy base FST initialization
 	baseFstLoaded bool
@@ -57,6 +59,36 @@ type Processor struct {
 
 func (p *Processor) GetBuildConfig() (concurrency int, progress BuildProgressFn) {
 	return p.buildConcurrency, p.buildProgress
+}
+
+// SetBuildProgressEx sets the extended progress callback that includes
+// estimated remaining time. When set, reportProgress will call this
+// in addition to the basic BuildProgressFn.
+func (p *Processor) SetBuildProgressEx(fn BuildProgressExFn) {
+	p.buildProgressEx = fn
+}
+
+// SetBuildStartTime records the build start time for estimated remaining
+// time calculation in reportProgress.
+func (p *Processor) SetBuildStartTime(t time.Time) {
+	p.buildStartTime = t
+}
+
+// ReportProgress calls both BuildProgressFn and BuildProgressExFn if set.
+// It calculates elapsed time and estimated remaining time based on progress.
+func (p *Processor) ReportProgress(stage string, current, total int) {
+	if p.buildProgress != nil {
+		p.buildProgress(stage, current, total)
+	}
+	if p.buildProgressEx != nil && total > 0 {
+		elapsed := time.Since(p.buildStartTime)
+		var estimatedRemaining time.Duration
+		if current > 0 {
+			// Simple linear estimation: remaining = elapsed * (total - current) / current
+			estimatedRemaining = elapsed * time.Duration(total-current) / time.Duration(current)
+		}
+		p.buildProgressEx(stage, current, total, elapsed, estimatedRemaining)
+	}
 }
 
 func NewProcessor(name string, ordertype ...string) *Processor {
@@ -183,6 +215,12 @@ func (p *Processor) BuildVerbalizer() {
 // BuildProgressFn reports build progress: stage name, current step, total steps.
 type BuildProgressFn func(stage string, current, total int)
 
+// BuildProgressExFn reports build progress with estimated remaining time.
+// elapsed is the time since the build started, estimatedRemaining is the
+// predicted time left based on current progress. If estimatedRemaining is 0,
+// the estimate is not available (e.g., current is 0 or total is 0).
+type BuildProgressExFn func(stage string, current, total int, elapsed time.Duration, estimatedRemaining time.Duration)
+
 // InitBaseFstCache loads or builds base FSTs only (no monolithic tagger/verbalizer).
 // Used by per-rule normalizers that don't need monolithic FSTs.
 func (p *Processor) InitBaseFstCache(prefix, cacheDir string, overwriteCache bool, progress BuildProgressFn) {
@@ -191,13 +229,14 @@ func (p *Processor) InitBaseFstCache(prefix, cacheDir string, overwriteCache boo
 	}
 	p.buildConcurrency = 2
 	p.buildProgress = progress
+	if p.buildStartTime.IsZero() {
+		p.buildStartTime = time.Now()
+	}
 	os.MkdirAll(cacheDir, 0755)
 
 	// Step 1: Load or build base FSTs (VSIGMA, CHAR, SIGMA, etc.)
 	if !p.tryLoadBaseFst(cacheDir, prefix) {
-		if progress != nil {
-			progress("构建基座FST", 1, 2)
-		}
+		p.ReportProgress("构建基座FST", 1, 2)
 		p.buildBaseFst()
 		p.saveBaseFst(cacheDir, prefix)
 	}
@@ -207,9 +246,7 @@ func (p *Processor) InitBaseFstCache(prefix, cacheDir string, overwriteCache boo
 	p.cache.StartEviction()
 	p.cachePrefix = prefix
 
-	if progress != nil {
-		progress("完成", 2, 2)
-	}
+	p.ReportProgress("完成", 2, 2)
 }
 
 // BuildFstWithCache handles cache read/write for tagger and verbalizer using
@@ -226,13 +263,14 @@ func (p *Processor) BuildFstWithCache(prefix, cacheDir string, overwriteCache bo
 	}
 	p.buildConcurrency = concurrency
 	p.buildProgress = progress
+	if p.buildStartTime.IsZero() {
+		p.buildStartTime = time.Now()
+	}
 	os.MkdirAll(cacheDir, 0755)
 
 	// Step 1: Load or build base FSTs (VSIGMA, CHAR, SIGMA, etc.)
 	if !p.tryLoadBaseFst(cacheDir, prefix) {
-		if progress != nil {
-			progress("构建基座FST", 1, 3)
-		}
+		p.ReportProgress("构建基座FST", 1, 3)
 		p.buildBaseFst()
 		p.saveBaseFst(cacheDir, prefix)
 	}
@@ -257,17 +295,11 @@ func (p *Processor) BuildFstWithCache(prefix, cacheDir string, overwriteCache bo
 		p.cache.Invalidate(prefix + "_verbalizer")
 	}
 
-	if progress != nil {
-		progress("加载Tagger", 2, 3)
-	}
+	p.ReportProgress("加载Tagger", 2, 3)
 	p.Tagger = p.cache.GetOrBuild(prefix+"_tagger", p.taggerBuilder)
-	if progress != nil {
-		progress("加载Verbalizer", 3, 3)
-	}
+	p.ReportProgress("加载Verbalizer", 3, 3)
 	p.Verbalizer = p.cache.GetOrBuild(prefix+"_verbalizer", p.verbalizerBuilder)
-	if progress != nil {
-		progress("完成", 3, 3)
-	}
+	p.ReportProgress("完成", 3, 3)
 }
 
 // tryLoadBaseFst attempts to load all base FSTs from disk cache.

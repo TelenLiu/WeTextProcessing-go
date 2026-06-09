@@ -75,6 +75,27 @@ func NewNormalizer(
 	tag_oov bool,
 	progress ...tn.BuildProgressFn,
 ) *Normalizer {
+	return NewNormalizerEx(cache_dir, overwrite_cache,
+		remove_interjections, remove_erhua, traditional_to_simple,
+		remove_puncts, full_to_half, tag_oov,
+		nil, progress...)
+}
+
+// NewNormalizerEx creates a Normalizer with an extended progress callback
+// that includes estimated remaining time. progressEx is called in addition
+// to any basic BuildProgressFn provided in the progress variadic args.
+func NewNormalizerEx(
+	cache_dir string,
+	overwrite_cache bool,
+	remove_interjections bool,
+	remove_erhua bool,
+	traditional_to_simple bool,
+	remove_puncts bool,
+	full_to_half bool,
+	tag_oov bool,
+	progressEx tn.BuildProgressExFn,
+	progress ...tn.BuildProgressFn,
+) *Normalizer {
 	// Extend global VCHAR with CJK characters for Chinese text processing.
 	// This must be done before any Processor is created (including rules).
 	charsetPath := tn.ChineseDataPath("data/char/charset_national_standard_2013_8105.tsv")
@@ -97,6 +118,12 @@ func NewNormalizer(
 	var pf tn.BuildProgressFn
 	if len(progress) > 0 {
 		pf = progress[0]
+	}
+	// Record build start time and set extended progress callback
+	// before any build operations begin.
+	n.Processor.SetBuildStartTime(time.Now())
+	if progressEx != nil {
+		n.Processor.SetBuildProgressEx(progressEx)
 	}
 	// Per-rule mode: only need base FST caching, not monolithic tagger/verbalizer.
 	// Load or build base FSTs (VSIGMA, CHAR, SIGMA, etc.) from cache.
@@ -235,7 +262,7 @@ func (n *Normalizer) checkRuleCacheExists() bool {
 // loadRulesFromCache loads all rule Tagger/Verbalizer FSTs from disk cache.
 // Cached FSTs are already optimized, so no RmEpsilon/Connect/ArcSort is needed.
 func (n *Normalizer) loadRulesFromCache() {
-	concurrency, progress := n.Processor.GetBuildConfig()
+	concurrency, _ := n.Processor.GetBuildConfig()
 
 	type loadTask struct {
 		name string
@@ -300,9 +327,7 @@ func (n *Normalizer) loadRulesFromCache() {
 			sem <- struct{}{}
 			task.fn()
 			<-sem
-			if progress != nil {
-				progress("加载缓存-"+task.name, idx+1, len(tasks)+1)
-			}
+			n.Processor.ReportProgress("加载缓存-"+task.name, idx+1, len(tasks)+1)
 		}(t, i)
 	}
 	wg.Wait()
@@ -311,14 +336,12 @@ func (n *Normalizer) loadRulesFromCache() {
 	n.mathRule = &rules.Math{Processor: tn.NewProcessorLazy("math")}
 	n.mathRule.Tagger, _ = pynini.FstRead(filepath.Join(n.ruleCacheDir, "math_tagger.fst"))
 	n.mathRule.Verbalizer, _ = pynini.FstRead(filepath.Join(n.ruleCacheDir, "math_verbalizer.fst"))
-	if progress != nil {
-		progress("加载缓存-math", len(tasks)+1, len(tasks)+1)
-	}
+	n.Processor.ReportProgress("加载缓存-math", len(tasks)+1, len(tasks)+1)
 }
 
 // buildRulesFromScratch builds all rule FSTs from scratch (the original logic).
 func (n *Normalizer) buildRulesFromScratch() {
-	concurrency, progress := n.Processor.GetBuildConfig()
+	concurrency, _ := n.Processor.GetBuildConfig()
 
 	type ruleTask struct {
 		name string
@@ -346,18 +369,14 @@ func (n *Normalizer) buildRulesFromScratch() {
 			sem <- struct{}{}
 			task.fn()
 			<-sem
-			if progress != nil {
-				progress("构建Tagger-"+task.name, idx+1, len(independent)+1)
-			}
+			n.Processor.ReportProgress("构建Tagger-"+task.name, idx+1, len(independent)+1)
 		}(t, i)
 	}
 	wg.Wait()
 
 	// mathRule depends on cardinalRule
 	n.mathRule = rules.NewMathWithCardinal(n.cardinalRule)
-	if progress != nil {
-		progress("构建Tagger-math", len(independent)+1, len(independent)+1)
-	}
+	n.Processor.ReportProgress("构建Tagger-math", len(independent)+1, len(independent)+1)
 
 	// Sort arcs for efficient binary search in composition.
 	// Apply RmEpsilon to eliminate epsilon arcs from tagger FSTs,
@@ -390,46 +409,32 @@ func (n *Normalizer) buildRulesFromScratch() {
 		optimized.PrepareForComposition()
 		return optimized
 	}
-	sortArcs(n.cardinalRule.Tagger)
-	n.cardinalRule.Tagger = optimizeTagger(n.cardinalRule.Tagger)
-	sortArcs(n.cardinalRule.Verbalizer)
-	n.cardinalRule.Verbalizer = optimizeVerbalizer(n.cardinalRule.Verbalizer)
-	sortArcs(n.dateRule.Tagger)
-	n.dateRule.Tagger = optimizeTagger(n.dateRule.Tagger)
-	sortArcs(n.dateRule.Verbalizer)
-	n.dateRule.Verbalizer = optimizeVerbalizer(n.dateRule.Verbalizer)
-	sortArcs(n.whitelistRule.Tagger)
-	n.whitelistRule.Tagger = optimizeTagger(n.whitelistRule.Tagger)
-	sortArcs(n.whitelistRule.Verbalizer)
-	n.whitelistRule.Verbalizer = optimizeVerbalizer(n.whitelistRule.Verbalizer)
-	sortArcs(n.sportRule.Tagger)
-	n.sportRule.Tagger = optimizeTagger(n.sportRule.Tagger)
-	sortArcs(n.sportRule.Verbalizer)
-	n.sportRule.Verbalizer = optimizeVerbalizer(n.sportRule.Verbalizer)
-	sortArcs(n.fractionRule.Tagger)
-	n.fractionRule.Tagger = optimizeTagger(n.fractionRule.Tagger)
-	sortArcs(n.fractionRule.Verbalizer)
-	n.fractionRule.Verbalizer = optimizeVerbalizer(n.fractionRule.Verbalizer)
-	sortArcs(n.measureRule.Tagger)
-	n.measureRule.Tagger = optimizeTagger(n.measureRule.Tagger)
-	sortArcs(n.measureRule.Verbalizer)
-	n.measureRule.Verbalizer = optimizeVerbalizer(n.measureRule.Verbalizer)
-	sortArcs(n.moneyRule.Tagger)
-	n.moneyRule.Tagger = optimizeTagger(n.moneyRule.Tagger)
-	sortArcs(n.moneyRule.Verbalizer)
-	n.moneyRule.Verbalizer = optimizeVerbalizer(n.moneyRule.Verbalizer)
-	sortArcs(n.timeRule.Tagger)
-	n.timeRule.Tagger = optimizeTagger(n.timeRule.Tagger)
-	sortArcs(n.timeRule.Verbalizer)
-	n.timeRule.Verbalizer = optimizeVerbalizer(n.timeRule.Verbalizer)
-	sortArcs(n.mathRule.Tagger)
-	n.mathRule.Tagger = optimizeTagger(n.mathRule.Tagger)
-	sortArcs(n.mathRule.Verbalizer)
-	n.mathRule.Verbalizer = optimizeVerbalizer(n.mathRule.Verbalizer)
-	sortArcs(n.charRule.Tagger)
-	n.charRule.Tagger = optimizeTagger(n.charRule.Tagger)
-	sortArcs(n.charRule.Verbalizer)
-	n.charRule.Verbalizer = optimizeVerbalizer(n.charRule.Verbalizer)
+	// Optimize all tagger and verbalizer FSTs.
+	// This is the most time-consuming step after building rules.
+	type optItem struct {
+		name      string
+		tagger    **pynini.Fst
+		verbalizer **pynini.Fst
+	}
+	optItems := []optItem{
+		{"cardinal", &n.cardinalRule.Tagger, &n.cardinalRule.Verbalizer},
+		{"date", &n.dateRule.Tagger, &n.dateRule.Verbalizer},
+		{"whitelist", &n.whitelistRule.Tagger, &n.whitelistRule.Verbalizer},
+		{"sport", &n.sportRule.Tagger, &n.sportRule.Verbalizer},
+		{"fraction", &n.fractionRule.Tagger, &n.fractionRule.Verbalizer},
+		{"measure", &n.measureRule.Tagger, &n.measureRule.Verbalizer},
+		{"money", &n.moneyRule.Tagger, &n.moneyRule.Verbalizer},
+		{"time", &n.timeRule.Tagger, &n.timeRule.Verbalizer},
+		{"math", &n.mathRule.Tagger, &n.mathRule.Verbalizer},
+		{"char", &n.charRule.Tagger, &n.charRule.Verbalizer},
+	}
+	for i, item := range optItems {
+		sortArcs(*item.tagger)
+		*item.tagger = optimizeTagger(*item.tagger)
+		sortArcs(*item.verbalizer)
+		*item.verbalizer = optimizeVerbalizer(*item.verbalizer)
+		n.Processor.ReportProgress("优化-"+item.name, i+1, len(optItems))
+	}
 }
 
 // saveRulesToCache saves all per-rule FSTs to disk cache.
