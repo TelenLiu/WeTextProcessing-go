@@ -71,23 +71,34 @@ func (e *Electronic) BuildTagger() {
 		protocolStart.Concat(protocolEnd),
 	)
 
+	// domainGraphWithClass: instead of using Compose with NOT_SPACE.Star() which
+	// causes state explosion, we directly build the domain graph with ALPHA prefix.
+	// Python: compose(ALPHA + NOT_SPACE.star + (ALPHA|DIGIT|accep("/")), domain_graph)
+	// Go: We use ALPHA.Plus() as a simpler pattern that still matches domain names
+	// starting with a letter, then Compose with domain_graph which is much smaller
+	// than NOT_SPACE.Star().
+	domainPrefix := e.ALPHA.Concat(e.ALPHA.Union(e.DIGIT).Union(pynini.Accep("/")).Union(pynini.Accep(".")).Union(pynini.Accep("-")).Star())
 	domainGraphWithClass := lib.Insert("domain: \"").Concat(
-		e.ALPHA.Concat(e.NOT_SPACE.Star()).Concat(
-			e.ALPHA.Union(e.DIGIT).Union(pynini.Accep("/"))).Compose(
-			domainGraph).Optimize()).Concat(lib.Insert("\""))
+		domainPrefix.Compose(domainGraph).Optimize()).Concat(lib.Insert("\""))
 
 	protocol = lib.Insert("protocol: \"").Concat(lib.AddWeight(protocol, -0.0001)).Concat(lib.Insert("\""))
 
-	// email
-	graph := e.VCHAR.Star().Concat(pynini.Accep("@")).Concat(e.VCHAR.Star()).Concat(
-		pynini.Accep(".")).Concat(e.VCHAR.Star()).Compose(
-		username.Concat(domainGraphWithClass))
+	// email: Instead of VCHAR.Star() Compose which causes state explosion,
+	// we directly use username + domainGraphWithClass since the Compose with
+	// VCHAR.Star() is just a pattern filter that's already handled by the
+	// username and domain graphs themselves.
+	// Python: compose(VCHAR.star + accep("@") + VCHAR.star + accep(".") + VCHAR.star, username + domain)
+	// Go: Directly build the email pattern without VCHAR.Star() wrapper.
+	graph := username.Concat(domainGraphWithClass)
 
-	// domain only
+	// domain only: Python requires the input to contain accepted_common_domains
+	// (e.g., ".com", ".edu") to avoid matching arbitrary strings like "Dr."
+	// Python: compose(ALPHA + NOT_SPACE.star + accepted_common_domains + NOT_SPACE.star, domain_graph)
+	// We use acceptedDomainsInput (projected input labels) as the required suffix.
+	domainOnlyPrefix := e.ALPHA.Concat(e.ALPHA.Union(e.DIGIT).Union(pynini.Accep("/")).Union(pynini.Accep(".")).Union(pynini.Accep("-")).Star()).Concat(acceptedDomainsInput)
 	graph = graph.Union(
 		lib.Insert("domain: \"").Concat(
-			e.ALPHA.Concat(e.NOT_SPACE.Star()).Concat(acceptedDomainsInput).Concat(
-				e.NOT_SPACE.Star()).Compose(domainGraph).Optimize()).Concat(lib.Insert("\"")),
+			domainOnlyPrefix.Compose(domainGraph).Optimize()).Concat(lib.Insert("\"")),
 	)
 
 	// with protocol

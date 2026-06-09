@@ -129,6 +129,11 @@ func (c *Cardinal) BuildTagger() {
 	c.Tagger = c.AddTokens(tagger)
 }
 
+// SetCachedNumber sets the Number FST from a cached value.
+func (c *Cardinal) SetCachedNumber(number *pynini.Fst) {
+	c.Number = number
+}
+
 func (c *Cardinal) Digits() *pynini.Fst {
 	return c.digits
 }

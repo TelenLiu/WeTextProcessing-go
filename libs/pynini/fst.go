@@ -58,11 +58,12 @@ type Arc struct {
 // State represents a state in the FST. Arcs are stored by value in a slice.
 // Epsilon counts are tracked for O(1) epsilon presence checks.
 type State struct {
-	Final   bool
-	Weight  float32
-	Arcs    []Arc
-	NumIEps int32
-	NumOEps int32
+	Final      bool
+	Weight     float32
+	Arcs       []Arc
+	NumIEps    int32
+	NumOEps    int32
+	FinalOLabel int32 // output label for final state (EpsilonLabel=0 means none)
 }
 
 // ilabelRangeMap stores precomputed ilabel-to-arc-index mapping for a state.
@@ -581,6 +582,7 @@ const maxComposeStates = 500000
 // Compose composes this FST with another FST.
 // Uses int label matching for O(1) comparison instead of string matching.
 // Includes a state limit (maxComposeStates) to prevent OOM from state explosion.
+// Optimized: pre-computes s2's ilabel index once, avoiding per-pair map allocation.
 func (f *Fst) Compose(other *Fst) *Fst {
 	if f == nil || other == nil {
 		return NewFst()
@@ -594,6 +596,34 @@ func (f *Fst) Compose(other *Fst) *Fst {
 	}
 	// Merge other's symbols, getting the mapping from old IDs to new IDs
 	otherMapping := result.Symbols.Merge(other.Symbols)
+
+	// Pre-compute s2's ilabel index for all states (avoid per-pair map allocation)
+	type ilabelArcs struct {
+		label int32
+		arcs  []Arc
+	}
+	s2ILabelIndex := make([][]ilabelArcs, len(other.States))
+	for s := range other.States {
+		arcs := other.States[s].Arcs
+		if len(arcs) == 0 {
+			continue
+		}
+		// Group arcs by mapped ilabel
+		labelMap := make(map[int32][]Arc)
+		for _, arc := range arcs {
+			mappedLabel := otherMapping[arc.ILabel]
+			labelMap[mappedLabel] = append(labelMap[mappedLabel], arc)
+		}
+		idx := make([]ilabelArcs, 0, len(labelMap))
+		for label, arcList := range labelMap {
+			idx = append(idx, ilabelArcs{label: label, arcs: arcList})
+		}
+		// Sort by label for binary search
+		sort.Slice(idx, func(i, j int) bool {
+			return idx[i].label < idx[j].label
+		})
+		s2ILabelIndex[s] = idx
+	}
 
 	type pair struct{ s1, s2 int32 }
 	startPair := pair{s1: f.Start, s2: other.Start}
@@ -612,23 +642,28 @@ func (f *Fst) Compose(other *Fst) *Fst {
 			continue
 		}
 		s1 := &f.States[p.s1]
-		s2 := &other.States[p.s2]
 
-		if s1.Final && s2.Final {
-			result.SetFinal(resultStateID, s1.Weight+s2.Weight)
+		if s1.Final && other.States[p.s2].Final {
+			result.SetFinal(resultStateID, s1.Weight+other.States[p.s2].Weight)
 		}
 
-		// Build a map of s2 arcs by input label for O(1) lookup
-		s2ByILabel := make(map[int32][]Arc)
-		for _, arc := range s2.Arcs {
-			mappedLabel := otherMapping[arc.ILabel]
-			s2ByILabel[mappedLabel] = append(s2ByILabel[mappedLabel], arc)
-		}
+		// Use pre-computed s2 ilabel index with binary search
+		s2Idx := s2ILabelIndex[p.s2]
 
 		// Process s1 arcs
 		for _, a1 := range s1.Arcs {
-			if arcs, ok := s2ByILabel[a1.OLabel]; ok {
-				for _, a2 := range arcs {
+			// Binary search for matching ilabel in s2 index
+			lo, hi := 0, len(s2Idx)
+			for lo < hi {
+				mid := lo + (hi-lo)/2
+				if s2Idx[mid].label < a1.OLabel {
+					lo = mid + 1
+				} else {
+					hi = mid
+				}
+			}
+			if lo < len(s2Idx) && s2Idx[lo].label == a1.OLabel {
+				for _, a2 := range s2Idx[lo].arcs {
 					np := pair{s1: a1.Next, s2: a2.Next}
 					npID, seen := visited[np]
 					if !seen {
@@ -664,7 +699,7 @@ func (f *Fst) Compose(other *Fst) *Fst {
 		}
 
 		// Process s2 epsilon input arcs
-		for _, a2 := range s2.Arcs {
+		for _, a2 := range other.States[p.s2].Arcs {
 			if a2.ILabel == EpsilonLabel {
 				np := pair{s1: p.s1, s2: a2.Next}
 				npID, seen := visited[np]
@@ -1529,10 +1564,11 @@ func (f *Fst) copy() *Fst {
 	}
 	for i := range f.States {
 		result.States[i] = State{
-			Final:   f.States[i].Final,
-			Weight:  f.States[i].Weight,
-			NumIEps: f.States[i].NumIEps,
-			NumOEps: f.States[i].NumOEps,
+			Final:      f.States[i].Final,
+			Weight:     f.States[i].Weight,
+			NumIEps:    f.States[i].NumIEps,
+			NumOEps:    f.States[i].NumOEps,
+			FinalOLabel: f.States[i].FinalOLabel,
 		}
 		if len(f.States[i].Arcs) > 0 {
 			result.States[i].Arcs = make([]Arc, len(f.States[i].Arcs))
@@ -1767,8 +1803,15 @@ func (f *Fst) PrepareForComposition() {
 	// reachable via input-epsilon arcs from s, in BFS order.
 	// Only pre-compute for states with small closures (<= maxEpsClosureSize)
 	// to limit memory usage. States with large closures fall back to runtime BFS.
+	// For large FSTs (> 10000 states), reduce the closure size limit to save memory.
 	if f.hasEpsArcs {
-		const maxEpsClosureSize = 200 // limit per-state closure size
+		maxEpsClosureSize := 500 // limit per-state closure size
+		if numStates > 10000 {
+			maxEpsClosureSize = 300 // reduce for large FSTs
+		}
+		if numStates > 50000 {
+			maxEpsClosureSize = 150 // further reduce for very large FSTs
+		}
 		f.epsClosureList = make([][]epsClosureEntry, numStates)
 		// Reusable arrays for BFS (avoid allocation per state)
 		visited := make([]uint32, numStates) // generation-based visited
@@ -1826,6 +1869,55 @@ func (f *Fst) PrepareForComposition() {
 				f.epsClosureList[s] = entries
 			}
 			// If tooLarge, epsClosureList[s] remains nil -> runtime BFS fallback
+		}
+
+		// Always pre-compute the start state's epsilon closure with a higher limit,
+		// since it's the most commonly accessed (used at position 0 of every composition).
+		if f.epsClosureList[f.Start] == nil && len(f.epsArcIdx[f.Start]) > 0 {
+			const startEpsClosureLimit = 5000
+			gen++
+			queue = queue[:0]
+			queue = append(queue, f.Start)
+			visited[f.Start] = gen
+			bestWeight[f.Start] = 0
+			var startEntries []epsClosureEntry
+			startTooLarge := false
+
+			for len(queue) > 0 {
+				cur := queue[0]
+				queue = queue[1:]
+				curW := bestWeight[cur]
+
+				for _, idx := range f.epsArcIdx[cur] {
+					arc := &f.States[cur].Arcs[idx]
+					nw := curW + arc.Weight
+					t := arc.Next
+					if visited[t] != gen || nw < bestWeight[t] {
+						bestWeight[t] = nw
+						startEntries = append(startEntries, epsClosureEntry{
+							target:    t,
+							from:      cur,
+							olabel:    arc.OLabel,
+							relWeight: nw,
+						})
+						if len(startEntries) > startEpsClosureLimit {
+							startTooLarge = true
+							break
+						}
+						if visited[t] != gen {
+							visited[t] = gen
+							queue = append(queue, t)
+						}
+					}
+				}
+				if startTooLarge {
+					break
+				}
+			}
+
+			if !startTooLarge {
+				f.epsClosureList[f.Start] = startEntries
+			}
 		}
 	}
 
@@ -1999,7 +2091,9 @@ func ComposeInputWithFst(inputStr string, f *Fst, other *Fst) string {
 					if len(epsFlat) == 0 {
 						continue
 					}
-					for i := range epsFlat {
+					// Active state limit for epsilon BFS
+				const maxActiveInputEpsStates = 500
+				for i := range epsFlat {
 						e := &epsFlat[i]
 						nw := curW + e.weight
 						t := e.next
@@ -2011,7 +2105,7 @@ func ComposeInputWithFst(inputStr string, f *Fst, other *Fst) string {
 							wasNew := curGen[t] != gen
 							curGen[t] = gen
 							epsQueue = append(epsQueue, t)
-							if wasNew {
+							if wasNew && len(curActive) < maxActiveInputEpsStates {
 								curActive = append(curActive, t)
 							}
 							ctx.ctxSet(intP, t, nw, intP, s, e.olabel)
@@ -2143,7 +2237,7 @@ type ComposePrefixResult struct {
 // ComposePrefixShortestPath composes the input string with the FST and finds
 // the best match that consumes a prefix of the input. Returns the output,
 // the number of input characters consumed, and the weight.
-// Optimized with dense arrays + generation counters (no map overhead).
+// Optimized with dense arrays and generation counters for cache efficiency.
 func ComposePrefixShortestPath(inputStr string, other *Fst) ComposePrefixResult {
 	if other == nil || inputStr == "" {
 		return ComposePrefixResult{}
@@ -2331,9 +2425,13 @@ func ComposePrefixShortestPath(inputStr string, other *Fst) ComposePrefixResult 
 	}
 
 	var output string
-	if len(olabels) > 0 {
+	if len(olabels) > 0 || other.States[bestEndState].FinalOLabel != EpsilonLabel {
 		for i, j := 0, len(olabels)-1; i < j; i, j = i+1, j-1 {
 			olabels[i], olabels[j] = olabels[j], olabels[i]
+		}
+		// Append final state output label (from RmOutputEpsilon)
+		if other.States[bestEndState].FinalOLabel != EpsilonLabel {
+			olabels = append(olabels, other.States[bestEndState].FinalOLabel)
 		}
 		var sb strings.Builder
 		for _, l := range olabels {
@@ -2391,7 +2489,7 @@ func ComposePrefixShortestPathRunesWithLabels(inputLabels []int32, effectiveLen 
 
 // composePrefixShortestPathCore is the shared core of ComposePrefixShortestPath*
 // functions. It composes pre-computed input labels with the FST and finds the
-// best match prefix using dense arrays + generation counters.
+// best match prefix using dense arrays and generation counters.
 func composePrefixShortestPathCore(inputLabels []int32, effectiveLen int, other *Fst) ComposePrefixResult {
 	numStates := len(other.States)
 	if numStates == 0 {
@@ -2432,6 +2530,10 @@ func composePrefixShortestPathCore(inputLabels []int32, effectiveLen int, other 
 		// Optimization: use pre-computed epsilon closure when there is exactly
 		// one active state (the start state at position 0). This avoids the
 		// expensive BFS over the entire epsilon closure of the start state.
+		// Active state limit: cap the number of active states to avoid
+		// exponential blowup in epsilon BFS for large FSTs.
+		// Must be large enough for date tagger's epsilon closure (~571 states).
+		const maxActiveStates = 2000
 		if other.hasEpsArcs {
 			intP := int32(p)
 			usePrecomputed := len(curActive) == 1 && p == 0 && other.epsClosureList[curActive[0]] != nil
@@ -2448,7 +2550,9 @@ func composePrefixShortestPathCore(inputLabels []int32, effectiveLen int, other 
 						curWeight[t] = nw
 						curGen[t] = gen
 						if wasNew {
-							curActive = append(curActive, t)
+							if len(curActive) < maxActiveStates {
+								curActive = append(curActive, t)
+							}
 						}
 						ctx.ctxSet(intP, t, nw, intP, entry.from, entry.olabel)
 					}
@@ -2463,6 +2567,7 @@ func composePrefixShortestPathCore(inputLabels []int32, effectiveLen int, other 
 					}
 				}
 				epsHead := 0
+				const maxActiveEpsStates = 2000
 				for epsHead < len(epsQueue) {
 					s := epsQueue[epsHead]
 					epsHead++
@@ -2486,7 +2591,7 @@ func composePrefixShortestPathCore(inputLabels []int32, effectiveLen int, other 
 							wasNew := curGen[t] != gen
 							curGen[t] = gen
 							epsQueue = append(epsQueue, t)
-							if wasNew {
+							if wasNew && len(curActive) < maxActiveEpsStates {
 								curActive = append(curActive, t)
 							}
 							ctx.ctxSet(intP, t, nw, intP, s, e.olabel)
@@ -2599,9 +2704,13 @@ func composePrefixShortestPathCore(inputLabels []int32, effectiveLen int, other 
 	}
 
 	var output string
-	if len(olabels) > 0 {
+	if len(olabels) > 0 || other.States[bestEndState].FinalOLabel != EpsilonLabel {
 		for i, j := 0, len(olabels)-1; i < j; i, j = i+1, j-1 {
 			olabels[i], olabels[j] = olabels[j], olabels[i]
+		}
+		// Append final state output label (from RmOutputEpsilon)
+		if other.States[bestEndState].FinalOLabel != EpsilonLabel {
+			olabels = append(olabels, other.States[bestEndState].FinalOLabel)
 		}
 		var sb strings.Builder
 		for _, l := range olabels {
@@ -2691,16 +2800,16 @@ func extractLinearInput(f *Fst) string {
 // Gob encoding registration
 // =============================================================================
 
-// composeContext holds reusable arrays for composition operations.
-// Uses dense 2D arrays with generation counters for backpointers.
-// Arrays are pooled and reused across calls to avoid allocation overhead.
+// composeContext holds reusable data for composition operations.
+// Uses dense arrays with generation counters instead of hash maps
+// for better cache locality and performance.
 type composeContext struct {
-	stride      int      // numStates, for computing flat index: pos*stride+state
-	bpFromPos   []int32  // [pos*stride+state] = source position
-	bpFromState []int32  // [pos*stride+state] = source state
-	bpOLabel    []int32  // [pos*stride+state] = output label
-	posGen      []uint32 // [pos*stride+state] = generation counter
-	curGen      uint32   // current generation (incremented per call)
+	stride      int
+	bpFromPos   []int32
+	bpFromState []int32
+	bpOLabel    []int32
+	posGen      []uint32
+	curGen      uint32
 
 	curActive  []int32
 	nextActive []int32
@@ -2708,8 +2817,8 @@ type composeContext struct {
 }
 
 // getOrCreateComposeScratch returns a composeScratch for this FST, reusing cached
-// memory to avoid GC-triggered allocation. The scratch is stored in the FST and
-// reused across calls.
+// arrays to avoid GC-triggered allocation. The scratch is stored in the FST and
+// reused across calls. Generation counters avoid the need to clear arrays.
 func (f *Fst) getOrCreateComposeScratch(numStates int) *composeScratch {
 	if f.composeScratch == nil {
 		f.composeScratch = &composeScratch{}
@@ -2731,7 +2840,7 @@ func (f *Fst) getOrCreateComposeScratch(numStates int) *composeScratch {
 }
 
 // getOrCreateComposeContext returns a composeContext for this FST, reusing cached
-// memory to avoid GC-triggered allocation.
+// arrays to avoid GC-triggered allocation.
 func (f *Fst) getOrCreateComposeContext(numPositions, numStates int) *composeContext {
 	if f.composeCtx == nil {
 		f.composeCtx = &composeContext{}
@@ -2793,7 +2902,9 @@ func (ctx *composeContext) ctxGet(pos, state int32) (float32, int32, int32, int3
 }
 
 // composeScratch holds reusable arrays for composition operations.
-// Stored in the FST to avoid GC-triggered reallocation of large arrays.
+// Uses dense arrays with generation counters instead of hash maps
+// for better cache locality and performance. Stored in the FST to
+// avoid GC-triggered reallocation of large arrays.
 type composeScratch struct {
 	curWeight  []float32
 	curGen     []uint32

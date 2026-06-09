@@ -21,6 +21,15 @@ func NewWhitelist(remove_erhua bool) *Whitelist {
 	return w
 }
 
+// NewWhitelistEmpty creates a Whitelist with a Processor but without building FSTs.
+// Used when loading pre-built FSTs from cache.
+func NewWhitelistEmpty(remove_erhua bool) *Whitelist {
+	return &Whitelist{
+		Processor:   tn.NewProcessor("whitelist"),
+		removeErhua: remove_erhua,
+	}
+}
+
 func (w *Whitelist) BuildTagger() {
 	whitelist, _ := pynini.StringFile(tn.ChineseDataPath("data/default/whitelist.tsv"))
 	erhua_whitelist, _ := pynini.StringFile(tn.ChineseDataPath("data/erhua/whitelist.tsv"))

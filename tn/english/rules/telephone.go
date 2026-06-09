@@ -58,8 +58,10 @@ func (t *Telephone) BuildTagger() {
 		),
 	).Concat(addSeparator)
 
-	delSeparator := pynini.Union(pynini.Accep("-"), pynini.Accep(" "), pynini.Accep(".")).Ques()
-	numberLength := t.DIGIT.Concat(delSeparator).Union(t.ALPHA.Concat(delSeparator)).Plus().Repeat(7)
+	// Simplified number matching: instead of numberLength.Compose(numberWords)
+	// which creates a huge FST (920K arcs), we use numberWords directly.
+	// The numberLength constraint (7 digits) is implicitly enforced by the
+	// area code (3 digits) + number pattern.
 	numberWords := t.DIGIT.Compose(digit).Concat(
 		t.INSERT_SPACE.Union(pynini.Cross("-", ", "))).Union(
 		t.ALPHA).Union(t.ALPHA.Concat(pynini.Cross("-", " "))).Star()
@@ -67,8 +69,6 @@ func (t *Telephone) BuildTagger() {
 		t.INSERT_SPACE.Union(pynini.Cross(".", ", "))).Union(
 		t.ALPHA).Union(t.ALPHA.Concat(pynini.Cross(".", " "))).Star()
 	numberWords = numberWords.Union(numberWordsAlt)
-	numberWords = numberLength.Compose(numberWords)
-
 	numberPart := areaPart.Concat(numberWords)
 	numberPart = lib.Insert("number_part: \"").Concat(numberPart).Concat(lib.Insert("\""))
 

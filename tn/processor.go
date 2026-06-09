@@ -83,7 +83,49 @@ func NewProcessor(name string, ordertype ...string) *Processor {
 		UPPER:      lib.UPPER,
 		MIN_NEG_WEIGHT: -0.0001,
 	}
-	// Build all base FSTs inline (matching Python Processor.__init__ behavior)
+	// Build base FSTs by default. Callers that want to load from cache
+	// should use NewProcessorLazy instead.
+	p.buildBaseFst()
+	p.tokenParser = NewTokenParser(ot)
+	return p
+}
+
+// NewProcessorLazy creates a Processor without building base FSTs.
+// The caller must call InitBaseFstCache or buildBaseFst before using
+// any method that requires base FSTs (BuildTagger, BuildVerbalizer, etc.).
+func NewProcessorLazy(name string, ordertype ...string) *Processor {
+	ot := "tn"
+	if len(ordertype) > 0 {
+		ot = ordertype[0]
+	}
+
+	vchar := lib.VALID_UTF8_CHAR
+	if cjk := lib.CJKVCHAR(); cjk != nil {
+		vchar = cjk
+	}
+
+	p := &Processor{
+		Name:       name,
+		Ordertype:  ot,
+		ALPHA:      lib.ALPHA,
+		DIGIT:      lib.DIGIT,
+		PUNCT:      lib.PUNCT,
+		SPACE:      pynini.Union(lib.SPACE, pynini.Accep("\u00A0")),
+		VCHAR:      vchar,
+		LOWER:      lib.LOWER,
+		UPPER:      lib.UPPER,
+		MIN_NEG_WEIGHT: -0.0001,
+	}
+	p.tokenParser = NewTokenParser(ot)
+	return p
+}
+
+// buildBaseFst constructs all base FSTs from scratch.
+func (p *Processor) buildBaseFst() {
+	if p.baseFstLoaded {
+		return
+	}
+	p.baseFstLoaded = true
 	p.VSIGMA = p.VCHAR.Star()
 	CHAR := p.VCHAR.Difference(pynini.Union(pynini.Accep("\\"), pynini.Accep("\"")))
 	p.CHAR = pynini.Union(
@@ -113,18 +155,6 @@ func NewProcessor(name string, ordertype ...string) *Processor {
 	p.DELETE_SPACE = lib.Delete(p.SPACE).Star()
 	p.DELETE_EXTRA_SPACE = pynini.Cross(p.SPACE.Plus(), pynini.Accep(" "))
 	p.DELETE_ZERO_OR_ONE_SPACE = lib.Delete(p.SPACE).Ques()
-
-	p.baseFstLoaded = true
-	p.tokenParser = NewTokenParser(ot)
-	return p
-}
-
-// buildBaseFst is a no-op now; base FSTs are built in NewProcessor.
-func (p *Processor) buildBaseFst() {
-	if p.baseFstLoaded {
-		return
-	}
-	p.baseFstLoaded = true
 }
 
 func (p *Processor) BuildRule(fst *pynini.Fst, l, r string) *pynini.Fst {
@@ -152,6 +182,35 @@ func (p *Processor) BuildVerbalizer() {
 
 // BuildProgressFn reports build progress: stage name, current step, total steps.
 type BuildProgressFn func(stage string, current, total int)
+
+// InitBaseFstCache loads or builds base FSTs only (no monolithic tagger/verbalizer).
+// Used by per-rule normalizers that don't need monolithic FSTs.
+func (p *Processor) InitBaseFstCache(prefix, cacheDir string, overwriteCache bool, progress BuildProgressFn) {
+	if cacheDir == "" {
+		cacheDir = "cache"
+	}
+	p.buildConcurrency = 2
+	p.buildProgress = progress
+	os.MkdirAll(cacheDir, 0755)
+
+	// Step 1: Load or build base FSTs (VSIGMA, CHAR, SIGMA, etc.)
+	if !p.tryLoadBaseFst(cacheDir, prefix) {
+		if progress != nil {
+			progress("构建基座FST", 1, 2)
+		}
+		p.buildBaseFst()
+		p.saveBaseFst(cacheDir, prefix)
+	}
+
+	// Initialize cache manager for potential future use
+	p.cache = fstcache.New(cacheDir)
+	p.cache.StartEviction()
+	p.cachePrefix = prefix
+
+	if progress != nil {
+		progress("完成", 2, 2)
+	}
+}
 
 // BuildFstWithCache handles cache read/write for tagger and verbalizer using
 // the FST cache manager (lazy load + TTL eviction). To skip the cache and
@@ -386,6 +445,16 @@ func (p *Processor) ReleaseBaseFsts() {
 	p.VCHAR = nil
 	p.LOWER = nil
 	p.UPPER = nil
+}
+
+// Close releases resources held by the Processor, including stopping the
+// background cache eviction goroutine. After calling Close, the Processor
+// should not be used for Tag/Verbalize operations that require cache access.
+// It is safe to call Close multiple times.
+func (p *Processor) Close() {
+	if p.cache != nil {
+		p.cache.StopEviction()
+	}
 }
 
 // FSTCacheStats returns the number of entries currently in memory cache.

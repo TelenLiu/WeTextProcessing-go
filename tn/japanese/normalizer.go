@@ -185,3 +185,11 @@ func (n *Normalizer) Normalize(input string) string {
 	}
 	return input
 }
+
+// Close releases resources held by the Normalizer, including stopping
+// background cache eviction goroutines. After calling Close, the Normalizer
+// should not be used for further Normalize calls. It is safe to call
+// Close multiple times.
+func (n *Normalizer) Close() {
+	n.Processor.Close()
+}

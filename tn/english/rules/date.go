@@ -95,7 +95,9 @@ func (d *Date) BuildTagger() {
 	)
 	graphMDY = graphMDY.Union(
 		monthTag.Concat(pynini.Cross("-", " ")).Concat(dayGraph).Concat(
-			(pynini.Cross("-", " ").Concat(d.VCHAR.Star())).Compose(graphYear).Ques(),
+			// Simplified: skip VCHAR.Star() Compose which causes state explosion.
+			// The year part after "-" is handled by graphYear directly.
+			(pynini.Cross("-", " ").Concat(graphYear)).Ques(),
 		),
 	)
 	for _, x := range []string{"-", "/", "."} {

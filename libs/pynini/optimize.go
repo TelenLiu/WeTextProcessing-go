@@ -120,10 +120,11 @@ func (f *Fst) Connect() *Fst {
 		}
 		newS := oldToNew[i]
 		result.States[newS] = State{
-			Final:   f.States[i].Final,
-			Weight:  f.States[i].Weight,
-			NumIEps: f.States[i].NumIEps,
-			NumOEps: f.States[i].NumOEps,
+			Final:      f.States[i].Final,
+			Weight:     f.States[i].Weight,
+			NumIEps:    f.States[i].NumIEps,
+			NumOEps:    f.States[i].NumOEps,
+			FinalOLabel: f.States[i].FinalOLabel,
 		}
 		if len(f.States[i].Arcs) > 0 {
 			result.States[newS].Arcs = make([]Arc, 0, len(f.States[i].Arcs))
@@ -149,6 +150,8 @@ func (f *Fst) Connect() *Fst {
 // epsilon closure algorithm. For each state, it computes the epsilon closure
 // and adds non-epsilon arcs from the closure, then removes epsilon arcs.
 // Weights from epsilon transitions are properly propagated to copied arcs.
+// Includes arc explosion protection: if the total number of new arcs would
+// exceed maxRmEpsilonArcs, the state's epsilon arcs are kept as-is.
 func (f *Fst) RmEpsilon() *Fst {
 	if f == nil {
 		return NewFst()
@@ -156,13 +159,22 @@ func (f *Fst) RmEpsilon() *Fst {
 
 	// Check if there are any epsilon transitions
 	hasEps := false
+	totalArcs := 0
 	for i := range f.States {
+		totalArcs += len(f.States[i].Arcs)
 		if f.States[i].HasIEpsilons() || f.States[i].HasOEpsilons() {
 			hasEps = true
-			break
 		}
 	}
 	if !hasEps {
+		return f.copy()
+	}
+
+	// Arc explosion protection: if the FST already has too many arcs,
+	// skip RmEpsilon entirely to avoid O(n²) arc explosion.
+	// This threshold is chosen to keep the result FST under ~2M arcs.
+	const maxRmEpsilonInputArcs = 500000
+	if totalArcs > maxRmEpsilonInputArcs {
 		return f.copy()
 	}
 
@@ -172,11 +184,27 @@ func (f *Fst) RmEpsilon() *Fst {
 	// to avoid O(n * avg_closure_size) memory usage.
 	// We compute closures on the ORIGINAL FST (f) to ensure correctness
 	// even as we modify the result.
+	// Per-state arc explosion protection: limit new arcs per state.
+	const maxArcsPerState = 10000
+	totalNewArcs := 0
+
 	for s := range result.States {
 		// Compute epsilon closure for state s on the original FST
 		closure, weights := computeEpsilonClosureWithWeights(f, int32(s))
 
-		newArcs := make([]Arc, 0, len(result.States[s].Arcs)+len(closure)*2)
+		estimatedNewArcs := 0
+		for _, epsState := range closure {
+			if epsState == int32(s) {
+				continue
+			}
+			estimatedNewArcs += len(f.States[epsState].Arcs)
+		}
+		if totalNewArcs+estimatedNewArcs > maxRmEpsilonInputArcs*4 {
+			// Skip this state to avoid arc explosion
+			continue
+		}
+
+		newArcs := make([]Arc, 0, len(result.States[s].Arcs)+estimatedNewArcs)
 		newIEps := int32(0)
 		newOEps := int32(0)
 
@@ -222,6 +250,32 @@ func (f *Fst) RmEpsilon() *Fst {
 			}
 		}
 
+		// Per-state arc limit
+		if len(newArcs) > maxArcsPerState {
+			// Keep only original non-epsilon arcs
+			origNonEps := make([]Arc, 0, len(result.States[s].Arcs))
+			for _, arc := range result.States[s].Arcs {
+				if arc.ILabel != EpsilonLabel || arc.OLabel != EpsilonLabel {
+					origNonEps = append(origNonEps, arc)
+				}
+			}
+			result.States[s].Arcs = origNonEps
+			// Recount epsilon arcs
+			ieps, oeps := int32(0), int32(0)
+			for _, arc := range origNonEps {
+				if arc.ILabel == EpsilonLabel {
+					ieps++
+				}
+				if arc.OLabel == EpsilonLabel {
+					oeps++
+				}
+			}
+			result.States[s].NumIEps = ieps
+			result.States[s].NumOEps = oeps
+			continue
+		}
+
+		totalNewArcs += len(newArcs)
 		result.States[s].Arcs = newArcs
 		result.States[s].NumIEps = newIEps
 		result.States[s].NumOEps = newOEps
@@ -275,6 +329,208 @@ func computeEpsilonClosureWithWeights(f *Fst, s int32) ([]int32, map[int32]float
 	}
 
 	return result, weights
+}
+
+// RmOutputEpsilon removes output-only epsilon arcs (ILabel=epsilon, OLabel!=epsilon)
+// by propagating their output labels to adjacent non-epsilon arcs. This is a
+// specialized optimization for FSTs produced by Insert() operations, where
+// chains of output-only epsilon arcs can be "inlined" into adjacent arcs.
+//
+// For example, if state s has an output-only epsilon arc to state t with
+// olabel="c", and state t has a non-epsilon arc with ilabel="1" and olabel="one",
+// then after RmOutputEpsilon, state s will have a non-epsilon arc with
+// ilabel="1" and olabel="cone" (the output label "c" is prepended).
+//
+// This dramatically reduces the number of epsilon arcs in tagger FSTs that
+// use Insert() for token wrapping (e.g., Insert("cardinal { ")).
+func (f *Fst) RmOutputEpsilon() *Fst {
+	if f == nil {
+		return NewFst()
+	}
+
+	// Check if there are any output-only epsilon arcs
+	hasOutputEps := false
+	totalArcs := 0
+	for i := range f.States {
+		totalArcs += len(f.States[i].Arcs)
+		for _, arc := range f.States[i].Arcs {
+			if arc.ILabel == EpsilonLabel && arc.OLabel != EpsilonLabel {
+				hasOutputEps = true
+				break
+			}
+		}
+	}
+	if !hasOutputEps {
+		return f.copy()
+	}
+
+	// Arc explosion protection
+	const maxRmOutputEpsInputArcs = 500000
+	if totalArcs > maxRmOutputEpsInputArcs {
+		return f.copy()
+	}
+
+	result := f.copy()
+
+	// For each state, compute the output-only epsilon closure:
+	// all states reachable via arcs where ILabel=epsilon (regardless of OLabel).
+	// Collect the accumulated output string and weight for each reachable state.
+	// Then, for each reachable state that has non-epsilon arcs, add those arcs
+	// to the current state with the accumulated output string prepended.
+	const maxArcsPerState = 10000
+	totalNewArcs := 0
+
+	for s := range result.States {
+		// Compute input-epsilon closure from state s on the original FST
+		type closureEntry struct {
+			state      int32
+			outputStr  string // accumulated output from output-only epsilon arcs
+			weight     float32
+		}
+
+		visited := make([]bool, len(f.States))
+		bestWeight := make([]float32, len(f.States))
+		bestOutput := make([]string, len(f.States))
+		var closure []closureEntry
+
+		queue := []closureEntry{{state: int32(s), outputStr: "", weight: 0}}
+		visited[s] = true
+		bestWeight[s] = 0
+		closure = append(closure, queue[0])
+
+		for len(queue) > 0 {
+			cur := queue[0]
+			queue = queue[1:]
+
+			if int(cur.state) >= len(f.States) {
+				continue
+			}
+
+			for _, arc := range f.States[cur.state].Arcs {
+				if arc.ILabel != EpsilonLabel {
+					continue // only follow input-epsilon arcs
+				}
+				t := arc.Next
+				if int(t) >= len(f.States) {
+					continue
+				}
+
+				// Build the output string: current accumulated output + this arc's output
+				newOutput := cur.outputStr
+				if arc.OLabel != EpsilonLabel {
+					newOutput += f.Symbols.Symbol(arc.OLabel)
+				}
+				nw := cur.weight + arc.Weight
+
+				if !visited[t] || nw < bestWeight[t] {
+					bestWeight[t] = nw
+					bestOutput[t] = newOutput
+					if !visited[t] {
+						visited[t] = true
+						closure = append(closure, closureEntry{state: t, outputStr: newOutput, weight: nw})
+						queue = append(queue, closureEntry{state: t, outputStr: newOutput, weight: nw})
+					}
+				}
+			}
+		}
+
+		if len(closure) <= 1 {
+			continue // no epsilon-reachable states (other than self)
+		}
+
+		estimatedNewArcs := 0
+		for _, entry := range closure {
+			if entry.state == int32(s) {
+				continue
+			}
+			for _, arc := range f.States[entry.state].Arcs {
+				if arc.ILabel != EpsilonLabel {
+					estimatedNewArcs++
+				}
+			}
+		}
+		if totalNewArcs+estimatedNewArcs > maxRmOutputEpsInputArcs*4 {
+			continue
+		}
+
+		// Build new arcs: keep non-epsilon arcs from this state,
+		// plus non-epsilon arcs from epsilon-reachable states with output prepended.
+		newArcs := make([]Arc, 0, len(result.States[s].Arcs)+estimatedNewArcs)
+		newIEps := int32(0)
+		newOEps := int32(0)
+
+		// Keep pure non-epsilon arcs from this state
+		for _, arc := range result.States[s].Arcs {
+			if arc.ILabel != EpsilonLabel {
+				newArcs = append(newArcs, arc)
+				if arc.OLabel == EpsilonLabel {
+					newOEps++
+				}
+			} else if arc.OLabel == EpsilonLabel {
+				// Pure epsilon arc: keep it (will be handled by RmEpsilon)
+				newArcs = append(newArcs, arc)
+				newIEps++
+				newOEps++
+			}
+			// Output-only epsilon arcs are NOT kept - they're being inlined
+		}
+
+		// Add non-epsilon arcs from epsilon-reachable states
+		for _, entry := range closure {
+			if entry.state == int32(s) {
+				continue
+			}
+			for _, arc := range f.States[entry.state].Arcs {
+				if arc.ILabel == EpsilonLabel {
+					continue // skip epsilon arcs from reachable states
+				}
+				// Prepend the accumulated output string to this arc's output
+				newOLabel := arc.OLabel
+				newArc := arc
+				if entry.outputStr != "" {
+					// Create a compound output label: accumulated output + arc's output
+					// We need to add the compound string to the symbol table
+					origOutput := f.Symbols.Symbol(arc.OLabel)
+					compoundOutput := entry.outputStr + origOutput
+					newOLabel = result.Symbols.FindOrAdd(compoundOutput)
+					newArc.OLabel = newOLabel
+				}
+				newArc.Weight += entry.weight
+				newArcs = append(newArcs, newArc)
+				if newArc.ILabel == EpsilonLabel {
+					newIEps++
+				}
+				if newArc.OLabel == EpsilonLabel {
+					newOEps++
+				}
+			}
+			// Propagate finality with accumulated output
+			if f.States[entry.state].Final {
+				totalWeight := f.States[entry.state].Weight + entry.weight
+				if !result.States[s].Final || totalWeight < result.States[s].Weight {
+					result.States[s].Final = true
+					result.States[s].Weight = totalWeight
+					// Store accumulated output from epsilon arcs as final output label
+					if entry.outputStr != "" {
+						result.States[s].FinalOLabel = result.Symbols.FindOrAdd(entry.outputStr)
+					} else {
+						result.States[s].FinalOLabel = EpsilonLabel
+					}
+				}
+			}
+		}
+
+		if len(newArcs) > maxArcsPerState {
+			continue
+		}
+
+		totalNewArcs += len(newArcs)
+		result.States[s].Arcs = newArcs
+		result.States[s].NumIEps = newIEps
+		result.States[s].NumOEps = newOEps
+	}
+
+	return result
 }
 
 // =============================================================================
@@ -500,9 +756,17 @@ func isDeterministic(f *Fst) bool {
 // and connecting. Determinize is enabled with a state count threshold:
 // for FSTs with more than 50000 states, determinization is skipped since
 // it can be expensive and the benefit is marginal for large FSTs.
+// RmEpsilon is skipped for FSTs with more than 50000 states to avoid
+// arc explosion and OOM.
 func (f *Fst) Optimize() *Fst {
 	if f == nil {
 		return NewFst()
+	}
+	// Skip RmEpsilon for very large FSTs to avoid arc explosion
+	if len(f.States) > 50000 {
+		result := f.Connect()
+		result.ArcSort("input")
+		return result
 	}
 	result := f.RmEpsilon()
 	// Determinize is disabled for now - the subset construction doesn't

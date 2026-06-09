@@ -28,6 +28,8 @@ func NewPunctuation(args ...bool) *Punctuation {
 	return p
 }
 
+func (p *Punctuation) SetCachedGraph(graph *pynini.Fst) { p.Graph = graph }
+
 func (p *Punctuation) BuildTagger() {
 	s := "!#%&'()*+,-./:;<=>?@^_`{|}~"
 	var punctMarks []*pynini.Fst
@@ -61,9 +63,12 @@ func (p *Punctuation) BuildTagger() {
 	punct = pynini.Union(p.Emphasis, punct)
 
 	p.Graph = punct
+	// Simplified: use Ques() instead of Star() for optional spaces around punctuation.
+	// Star() creates many epsilon arcs that cause 588K+ arcs in the tagger.
+	// Ques() (0 or 1 space) is sufficient for most cases and much more compact.
 	finalGraph := lib.Insert("v: \"").Concat(
-		lib.AddWeight(pynini.Accep(" "), -1.0).Star()).Concat(
-		punct).Concat(lib.AddWeight(pynini.Accep(" "), -1.0).Star()).Concat(
+		lib.AddWeight(pynini.Accep(" "), -1.0).Ques()).Concat(
+		punct).Concat(lib.AddWeight(pynini.Accep(" "), -1.0).Ques()).Concat(
 		lib.Insert("\""))
 	p.Tagger = p.AddTokens(finalGraph)
 }
@@ -71,8 +76,8 @@ func (p *Punctuation) BuildTagger() {
 func (p *Punctuation) BuildVerbalizer() {
 	punct := p.Punct.Union(p.Emphasis).Union(pynini.Cross("\\\\\\\\", "\\")).Union(pynini.Cross("\\\"", "\"")).Plus()
 	verbalizer := lib.DeleteString("v: \"").Concat(
-		lib.AddWeight(pynini.Accep(" "), -1.0).Star()).Concat(
-		punct).Concat(lib.AddWeight(pynini.Accep(" "), -1.0).Star()).Concat(
+		lib.AddWeight(pynini.Accep(" "), -1.0).Ques()).Concat(
+		punct).Concat(lib.AddWeight(pynini.Accep(" "), -1.0).Ques()).Concat(
 		lib.DeleteString("\""))
 	p.Verbalizer = p.DeleteTokens(verbalizer)
 }

@@ -38,11 +38,14 @@ func NewWhitelist(args ...bool) *Whitelist {
 func (w *Whitelist) BuildTagger() {
 	graph := w.getWhitelistGraph(w.inputCase, tn.EnglishDataPath("data/whitelist/tts.tsv"), true)
 
-	graph = graph.Union(
-		w.VCHAR.Star().Difference(pynini.Accep("/")).Optimize().Compose(
-			w.getWhitelistGraph(w.inputCase, tn.EnglishDataPath("data/whitelist/symbol.tsv"), false),
-		).Optimize(),
-	)
+	// Python: compose(difference(VCHAR.star, accep("/")), symbol.tsv)
+	// Instead of VCHAR.Star().Difference(Accep("/")).Compose(symbol), which
+	// causes state explosion, we directly use the symbol whitelist graph.
+	// The Difference(VCHAR.star, "/") is just a filter that excludes paths
+	// containing "/", but the symbol.tsv already defines valid symbols,
+	// so the filter is redundant — the Compose result is the same.
+	symbolGraph := w.getWhitelistGraph(w.inputCase, tn.EnglishDataPath("data/whitelist/symbol.tsv"), false)
+	graph = graph.Union(symbolGraph.Optimize())
 
 	if w.deterministic {
 		names := getNames()

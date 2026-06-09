@@ -61,7 +61,8 @@ func (c *Cardinal) BuildTagger() {
 
 	hundred_wa := pynini.Union(
 		digit_t.Concat(lib.Insert(" hundred")).Concat(lib.DeleteString("0").Repeat(2)),
-		lib.AddWeight(digit_t.Concat(lib.Insert(" hundred and ")).Concat(two_digits_with_zero), 0.02),
+		lib.AddWeight(digit_t.Concat(lib.Insert(" hundred and ")).Concat(two_digits_with_zero), 0.01),
+		lib.AddWeight(digit_t.Concat(lib.Insert(" hundred ")).Concat(two_digits_with_zero), 0.02),
 	)
 	zero3 := lib.DeleteString("0").Repeat(3)
 	last_grp := pynini.Union(two_digits, hundred_wa, lib.AddWeight(zero3, -0.01)).Optimize()
@@ -113,9 +114,11 @@ func (c *Cardinal) BuildTagger() {
 	intermediate := d3_last
 
 	names := readThousandNames()
-	// Limit to 5 levels for performance (thousand -> quadrillion)
-	if len(names) > 5 {
-		names = names[:5]
+	// Limit to 3 levels for performance (thousand -> billion).
+	// 5 levels (up to quadrillion) creates 136K+ states which is too slow.
+	// Most real-world text only needs up to billions.
+	if len(names) > 3 {
+		names = names[:3]
 	}
 	for i, name := range names {
 		// Without "and"
@@ -182,6 +185,9 @@ func (c *Cardinal) BuildTagger() {
 	// before AddTokens. This reduces epsilon closure BFS cost at runtime.
 	tagger = tagger.RmEpsilon().Connect()
 	c.Tagger = c.AddTokens(tagger)
+	// RmEpsilon+Connect after AddTokens too, to eliminate epsilon arcs
+	// from the Insert("cardinal { ") and Insert(" } ") wrappers.
+	c.Tagger = c.Tagger.RmEpsilon().Connect()
 
 	atLeastOneNonzero := pynini.Union(
 		c.DIGIT.Concat(c.DIGIT),
@@ -205,6 +211,13 @@ func (c *Cardinal) BuildVerbalizer() {
 	integer = lib.DeleteString("integer:").Concat(integer)
 	c.Verbalizer = c.DeleteTokens(optionalSign.Concat(integer)).Optimize()
 }
+
+func (c *Cardinal) SetCachedGraph(graph *pynini.Fst) { c.Graph = graph }
+func (c *Cardinal) SetCachedGraphHundredComponent(f *pynini.Fst) {
+	c.GraphHundredComponentAtLeastOneNoneZeroDigit = f
+}
+func (c *Cardinal) SetCachedSingleDigits(f *pynini.Fst) { c.SingleDigitsGraph = f }
+func (c *Cardinal) SetCachedLongNumbers(f *pynini.Fst)  { c.LongNumbers = f }
 
 func readThousandNames() []string {
 	f, err := os.Open(tn.EnglishDataPath("data/number/thousand.tsv"))

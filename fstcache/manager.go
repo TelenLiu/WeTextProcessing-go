@@ -38,6 +38,7 @@ type Manager struct {
 	entries  sync.Map
 	ttl      time.Duration
 	stopCh   chan struct{}
+	stopOnce sync.Once
 	started  atomic.Bool
 }
 
@@ -152,9 +153,9 @@ func (m *Manager) StopEviction() {
 		return
 	}
 	m.started.Store(false)
-	// Closing an already-closed channel panics. Use recover to be safe.
-	defer func() { recover() }()
-	close(m.stopCh)
+	m.stopOnce.Do(func() {
+		close(m.stopCh)
+	})
 }
 
 func (m *Manager) evict() {
