@@ -1,10 +1,11 @@
 package main
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 
 	ja_itn "github.com/TelenLiu/WeTextProcessing-go/itn/japanese"
 )
@@ -66,9 +67,9 @@ func main() {
 		{"十三湖", "十三湖", "白名单"},
 	}
 
-	fmt.Println("=== ITN Japanese InverseNormalizer 示例 ===")
-	fmt.Println("模式: full_to_half=false, enable_standalone_number=true, enable_0_to_9=true")
-	fmt.Println()
+	log.Info("=== ITN Japanese InverseNormalizer 示例 ===")
+	log.Info("模式: full_to_half=false, enable_standalone_number=true, enable_0_to_9=true")
+	log.Info()
 	for _, tc := range testCases {
 		start := time.Now()
 		output := n.Normalize(tc.input)
@@ -76,6 +77,6 @@ func main() {
 		if output != tc.expected {
 			status = "✗"
 		}
-		fmt.Printf("[%s] %s 输入: %q\n输出: %q (期望: %q) (%v)\n\n", tc.desc, status, tc.input, output, tc.expected, time.Since(start))
+		log.Infof("[%s] %s 输入: %q\n输出: %q (期望: %q) (%v)\n\n", tc.desc, status, tc.input, output, tc.expected, time.Since(start))
 	}
 }

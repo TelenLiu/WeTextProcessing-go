@@ -1,13 +1,14 @@
 package chinese
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 
 	"github.com/TelenLiu/WeTextProcessing-go/libs/pynini"
 	"github.com/TelenLiu/WeTextProcessing-go/libs/pynini/lib"
@@ -440,7 +441,7 @@ func (n *Normalizer) buildRulesFromScratch() {
 // saveRulesToCache saves all per-rule FSTs to disk cache.
 func (n *Normalizer) saveRulesToCache() {
 	if err := os.MkdirAll(n.ruleCacheDir, 0755); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: failed to create rule cache dir %s: %v\n", n.ruleCacheDir, err)
+		log.Errorf("failed to create rule cache dir %s: %v\n", n.ruleCacheDir, err)
 		return
 	}
 
@@ -478,7 +479,7 @@ func (n *Normalizer) saveRulesToCache() {
 		}
 		path := filepath.Join(n.ruleCacheDir, item.name+".fst")
 		if err := pynini.FstWrite(item.fst, path); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to write rule cache %s: %v\n", path, err)
+			log.Errorf("failed to write rule cache %s: %v\n", path, err)
 		}
 	}
 }

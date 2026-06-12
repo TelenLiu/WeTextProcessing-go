@@ -1,10 +1,11 @@
 package main
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 
 	chinese_itn "github.com/TelenLiu/WeTextProcessing-go/itn/chinese"
 )
@@ -21,10 +22,10 @@ func main() {
 		"尾号幺七零二",
 	}
 
-	fmt.Println("=== ITN Cardinal (口语转数字) 规则示例 ===")
+	log.Info("=== ITN Cardinal (口语转数字) 规则示例 ===")
 	for _, input := range testCases {
 		start := time.Now()
 		output := n.Normalize(input)
-		fmt.Printf("输入: %q\n输出: %q (%v)\n\n", input, output, time.Since(start))
+		log.Infof("输入: %q\n输出: %q (%v)\n\n", input, output, time.Since(start))
 	}
 }

@@ -1,10 +1,11 @@
 package main
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 
 	chinese "github.com/TelenLiu/WeTextProcessing-go/tn/chinese"
 )
@@ -23,10 +24,10 @@ func main() {
 		"1:02:36 am",
 	}
 
-	fmt.Println("=== Time (时间) 规则示例 ===")
+	log.Info("=== Time (时间) 规则示例 ===")
 	for _, input := range testCases {
 		start := time.Now()
 		output := n.Normalize(input)
-		fmt.Printf("输入: %q\n输出: %q (%v)\n\n", input, output, time.Since(start))
+		log.Infof("输入: %q\n输出: %q (%v)\n\n", input, output, time.Since(start))
 	}
 }

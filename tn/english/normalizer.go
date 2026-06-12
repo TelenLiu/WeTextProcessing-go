@@ -10,6 +10,8 @@ import (
 	"sync"
 	"time"
 
+	log "github.com/sirupsen/logrus"
+
 	"github.com/TelenLiu/WeTextProcessing-go/libs/pynini"
 	"github.com/TelenLiu/WeTextProcessing-go/tn"
 	"github.com/TelenLiu/WeTextProcessing-go/tn/english/rules"
@@ -528,7 +530,7 @@ func (n *Normalizer) buildRulesFromScratch() {
 // saveRulesToCache saves all per-rule FSTs to disk cache.
 func (n *Normalizer) saveRulesToCache() {
 	if err := os.MkdirAll(n.ruleCacheDir, 0755); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: failed to create rule cache dir %s: %v\n", n.ruleCacheDir, err)
+		log.Errorf("failed to create rule cache dir %s: %v\n", n.ruleCacheDir, err)
 		return
 	}
 
@@ -578,7 +580,7 @@ func (n *Normalizer) saveRulesToCache() {
 		}
 		path := filepath.Join(n.ruleCacheDir, item.name+".fst")
 		if err := pynini.FstWrite(item.fst, path); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to write rule cache %s: %v\n", path, err)
+			log.Errorf("failed to write rule cache %s: %v\n", path, err)
 		}
 	}
 }
@@ -2157,7 +2159,7 @@ func (n *Normalizer) DebugRuleStats() []struct {
 func (n *Normalizer) PrintStats() {
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
-	fmt.Printf("Build time: %v, Memory: Alloc=%vMB, Sys=%vMB\n",
+	log.Infof("Build time: %v, Memory: Alloc=%vMB, Sys=%vMB\n",
 		n.buildTime, m.Alloc/1024/1024, m.Sys/1024/1024)
 }
 

@@ -1,10 +1,11 @@
 package main
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 
 	chinese "github.com/TelenLiu/WeTextProcessing-go/tn/chinese"
 )
@@ -21,10 +22,10 @@ func main() {
 		"CNY 1.25",
 	}
 
-	fmt.Println("=== Money (货币) 规则示例 ===")
+	log.Info("=== Money (货币) 规则示例 ===")
 	for _, input := range testCases {
 		start := time.Now()
 		output := n.Normalize(input)
-		fmt.Printf("输入: %q\n输出: %q (%v)\n\n", input, output, time.Since(start))
+		log.Infof("输入: %q\n输出: %q (%v)\n\n", input, output, time.Since(start))
 	}
 }
